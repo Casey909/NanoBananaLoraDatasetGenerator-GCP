@@ -210,7 +210,8 @@ export async function generateImage({
   for (const ref of refs) {
     const { mimeType, data } = stripDataUrl(ref);
     if (data) {
-      parts.push({ inline_data: { mime_type: mimeType, data } });
+      // Proto JSON uses camelCase on REST (inlineData / mimeType).
+      parts.push({ inlineData: { mimeType, data } });
     }
   }
   parts.push({ text: prompt });
@@ -257,7 +258,7 @@ export async function generateText({
   const parts = [];
   for (const img of imageDataUrls) {
     const { mimeType, data } = stripDataUrl(img);
-    if (data) parts.push({ inline_data: { mime_type: mimeType, data } });
+    if (data) parts.push({ inlineData: { mimeType, data } });
   }
   parts.push({ text: userText });
 
