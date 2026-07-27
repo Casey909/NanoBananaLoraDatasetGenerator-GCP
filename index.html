@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GCP LoRA Character Dataset Generator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app-container">
+    <header class="header">
+      <div class="logo">
+        <span class="logo-icon" aria-hidden="true">🍌</span>
+        <div>
+          <h1>GCP LoRA Character Dataset</h1>
+          <p class="logo-sub">Nano Banana 2 / Lite / Pro · Gemini Flash · Vertex or AI Studio</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button class="btn-icon" type="button" onclick="showApiKeyModal()" title="Credentials">🔑</button>
+        <div class="status-bar">
+          <span id="statusDot" class="status-dot"></span>
+          <span id="statusText">Checking...</span>
+        </div>
+      </div>
+    </header>
+
+    <div class="main-content">
+      <aside class="sidebar">
+        <section class="panel">
+          <h2>Dataset</h2>
+          <div class="dataset-count">
+            <div class="count" id="pairCount">0</div>
+            <small id="countLabel">images in memory</small>
+          </div>
+          <div class="auto-actions" style="margin-top:12px;flex-direction:column">
+            <button class="btn btn-primary" type="button" onclick="downloadZIP()">Download ZIP</button>
+            <button class="btn btn-danger" type="button" onclick="clearResults()">Clear All</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Settings</h2>
+
+          <div class="form-group">
+            <label for="aspectRatio">Aspect Ratio</label>
+            <select id="aspectRatio">
+              <option value="1:1">1:1 Square</option>
+              <option value="16:9">16:9 Landscape</option>
+              <option value="9:16">9:16 Portrait</option>
+              <option value="4:3">4:3</option>
+              <option value="3:4">3:4</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="resolution">Resolution</label>
+            <select id="resolution"></select>
+            <small>Lite image model supports 1K only</small>
+          </div>
+
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="useVisionCaption" />
+              Vision captions (Flash LLM)
+            </label>
+          </div>
+
+          <div class="form-group">
+            <label for="imageModel">Image model</label>
+            <select id="imageModel"></select>
+          </div>
+
+          <div class="form-group">
+            <label for="llmModel">LLM / caption model</label>
+            <select id="llmModel"></select>
+          </div>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <section class="panel">
+          <h2>Generate Dataset</h2>
+          <div class="auto-intro">
+            <p>
+              Upload a few character refs (face, body, etc.). Pick a Nano Banana image model and a Flash LLM.
+              Generates a diverse LoRA-ready image pack with captions, downloadable as ZIP.
+            </p>
+          </div>
+
+          <div class="form-group">
+            <label>Generation Mode</label>
+            <div class="mode-selector">
+              <button type="button" class="mode-btn active" data-mode="character" onclick="setMode('character')">
+                <span class="mode-icon">👤</span>
+                <span class="mode-label">Character LoRA</span>
+                <span class="mode-desc">Multi-ref identity pack</span>
+              </button>
+              <button type="button" class="mode-btn" data-mode="pair" onclick="setMode('pair')">
+                <span class="mode-icon">🔄</span>
+                <span class="mode-label">Pair Mode</span>
+                <span class="mode-desc">START → END edits</span>
+              </button>
+              <button type="button" class="mode-btn" data-mode="single" onclick="setMode('single')">
+                <span class="mode-icon">🖼️</span>
+                <span class="mode-label">Single Image</span>
+                <span class="mode-desc">Style / aesthetic</span>
+              </button>
+              <button type="button" class="mode-btn" data-mode="reference" onclick="setMode('reference')">
+                <span class="mode-icon">📷</span>
+                <span class="mode-label">Reference</span>
+                <span class="mode-desc">One image variations</span>
+              </button>
+              <button type="button" class="mode-btn" data-mode="import-edit" onclick="setMode('import-edit')">
+                <span class="mode-icon">📂</span>
+                <span class="mode-label">Import + Edit</span>
+                <span class="mode-desc">Edit your folder</span>
+              </button>
+            </div>
+          </div>
+
+          <div id="characterRefsSection" class="form-group">
+            <label>Character reference images</label>
+            <div id="characterSlots" class="character-slots"></div>
+            <small>Front face is required. Extra refs improve identity lock (Nano Banana 2 / Pro handle multiple refs best).</small>
+          </div>
+
+          <div id="characterNameSection" class="form-group">
+            <label for="characterName">Character name</label>
+            <input id="characterName" type="text" placeholder="e.g. Aria Chen" />
+            <label class="checkbox-label" style="margin-top:8px">
+              <input type="checkbox" id="useCharacterPresets" checked />
+              Use curated LoRA shot presets (recommended)
+            </label>
+          </div>
+
+          <div id="referenceUploadSection" class="form-group hidden">
+            <label>Reference Image</label>
+            <div class="reference-upload">
+              <div class="upload-zone" id="uploadZone" onclick="document.getElementById('referenceInput').click()">
+                <input id="referenceInput" type="file" accept="image/*" hidden onchange="handleReferenceUpload(event)" />
+                <div class="upload-placeholder" id="uploadPlaceholder">
+                  <span class="upload-icon">📤</span>
+                  <span>Click or drop reference</span>
+                </div>
+                <img id="referencePreview" class="reference-preview hidden" alt="reference" />
+              </div>
+              <button id="clearRefBtn" type="button" class="btn btn-sm btn-secondary" style="display:none" onclick="clearReference()">Clear</button>
+            </div>
+          </div>
+
+          <div id="importEditSection" class="form-group hidden">
+            <label>Import Images</label>
+            <div class="import-upload">
+              <div class="upload-zone" onclick="document.getElementById('importInput').click()">
+                <input id="importInput" type="file" accept="image/*" multiple webkitdirectory directory hidden onchange="handleImportUpload(event)" />
+                <div class="upload-placeholder" id="importPlaceholder">
+                  <span class="upload-icon">📂</span>
+                  <span>Select a folder of images</span>
+                </div>
+              </div>
+              <div id="importPreviewList" class="import-preview-list hidden"></div>
+              <button id="clearImportBtn" type="button" class="btn btn-sm btn-secondary" style="display:none" onclick="clearImportedImages()">Clear All</button>
+            </div>
+            <div class="form-group" style="margin-top:12px">
+              <label for="importTransformation">Transformation to apply</label>
+              <textarea id="importTransformation" placeholder="e.g. Change clothing to a red leather jacket, keep identity"></textarea>
+            </div>
+          </div>
+
+          <div id="themeSection" class="form-group">
+            <label for="theme" id="themeLabel">Dataset theme / notes</label>
+            <textarea id="theme" placeholder="e.g. young East Asian woman, short black bob, warm skin tone; keep casual modern wardrobe"></textarea>
+          </div>
+
+          <div id="transformationSection" class="form-group hidden">
+            <label for="transformation">Transformation to learn</label>
+            <input id="transformation" type="text" placeholder="e.g. zoom out, add background, change lighting" />
+          </div>
+
+          <div id="actionNameSection" class="form-group hidden">
+            <label for="actionName">Action name (optional)</label>
+            <input id="actionName" type="text" placeholder="e.g. unzoom" />
+          </div>
+
+          <div class="form-group">
+            <label for="triggerWord">Trigger word (optional — prepended to .txt)</label>
+            <input id="triggerWord" type="text" placeholder="e.g. ohwx person" />
+          </div>
+
+          <div class="form-group">
+            <div class="collapsible-header" onclick="toggleSystemPrompt()">
+              <span>Custom system prompt</span>
+              <span id="systemPromptIcon">▶</span>
+            </div>
+            <div id="systemPromptSection" class="collapsible-content hidden">
+              <textarea id="customSystemPrompt" placeholder=""></textarea>
+              <button type="button" class="btn btn-sm btn-secondary" onclick="resetSystemPrompt()">Reset to default</button>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="numPairs"><span id="pairOrImageLabel">Images</span> (max 40)</label>
+            <input id="numPairs" type="number" min="1" max="40" value="20" />
+            <small id="costEstimate">Estimating...</small>
+          </div>
+
+          <div class="form-group">
+            <label for="maxConcurrent">Parallel requests</label>
+            <input id="maxConcurrent" type="number" min="1" max="10" value="2" />
+            <small>Start low (1–2) to avoid rate limits</small>
+          </div>
+
+          <div class="auto-actions">
+            <button class="btn btn-generate" type="button" onclick="startGeneration()">Start Generation</button>
+            <button class="btn btn-secondary" type="button" onclick="stopGeneration()">Stop</button>
+          </div>
+        </section>
+
+        <section id="progressPanel" class="panel progress-panel hidden">
+          <h2>Progress</h2>
+          <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
+          <div class="progress-text"><span id="progressCurrent">0</span> / <span id="progressTotal">0</span> <span id="progressLabel">images</span></div>
+          <div id="progressStatus" class="progress-status">Initializing...</div>
+          <div id="progressLog" class="progress-log"></div>
+        </section>
+
+        <section class="panel results-panel">
+          <h2>Results</h2>
+          <div id="loadingIndicator" class="loading hidden">
+            <div class="spinner"></div>
+            <span>Working...</span>
+          </div>
+          <div id="results" class="results-grid"></div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div id="apiKeyModal" class="modal hidden">
+    <div class="modal-content">
+      <h2>GCP / Gemini credentials</h2>
+      <p class="modal-desc">
+        Use a <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio API key</a>
+        or Vertex AI (project + access token). Stored only in this browser.
+      </p>
+
+      <div class="form-group">
+        <label for="providerSelect">Provider</label>
+        <select id="providerSelect" onchange="syncProviderFields()">
+          <option value="google-ai">Google AI Studio (API key)</option>
+          <option value="vertex">Vertex AI (GCP)</option>
+        </select>
+      </div>
+
+      <div id="googleAiFields">
+        <div class="form-group">
+          <label for="apiKeyInput">API key</label>
+          <div class="api-key-input">
+            <input id="apiKeyInput" type="password" placeholder="AIza..." autocomplete="off" />
+            <button type="button" class="btn-icon" onclick="toggleKeyVisibility('apiKeyInput','keyVisibilityIcon')"><span id="keyVisibilityIcon">Show</span></button>
+          </div>
+        </div>
+      </div>
+
+      <div id="vertexFields" class="hidden">
+        <div class="form-group">
+          <label for="vertexProjectInput">GCP project ID</label>
+          <input id="vertexProjectInput" type="text" placeholder="my-gcp-project" />
+        </div>
+        <div class="form-group">
+          <label for="vertexLocationInput">Location</label>
+          <input id="vertexLocationInput" type="text" value="global" placeholder="global" />
+        </div>
+        <div class="form-group">
+          <label for="vertexTokenInput">Access token</label>
+          <div class="api-key-input">
+            <input id="vertexTokenInput" type="password" placeholder="gcloud auth print-access-token" autocomplete="off" />
+            <button type="button" class="btn-icon" onclick="toggleKeyVisibility('vertexTokenInput','tokenVisibilityIcon')"><span id="tokenVisibilityIcon">Show</span></button>
+          </div>
+          <small>Run <code>gcloud auth print-access-token</code> and paste here</small>
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" onclick="hideApiKeyModal()">Cancel</button>
+        <button type="button" class="btn btn-danger" onclick="clearApiKey()">Clear</button>
+        <button type="button" class="btn btn-primary" onclick="saveApiKey()">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
