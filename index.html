@@ -222,14 +222,24 @@
             <small>Retries 429 / quota / network failures with backoff until all succeed or you Stop</small>
           </div>
 
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="verboseDebug" checked />
+              Verbose debug logs
+            </label>
+            <small>Shows request IDs, timings, ref sizes. Download JSON for full server+client logs.</small>
+          </div>
+
           <div class="auto-actions">
             <button class="btn btn-generate" type="button" onclick="startGeneration()">Start Generation</button>
             <button class="btn btn-secondary" type="button" onclick="stopGeneration()">Stop</button>
+            <button class="btn btn-secondary" type="button" onclick="downloadDebugLogs()">Download Debug Logs</button>
+            <button class="btn btn-secondary" type="button" onclick="refreshServerLogsIntoUi()">Show Server Logs</button>
           </div>
         </section>
 
         <section id="progressPanel" class="panel progress-panel hidden">
-          <h2>Progress</h2>
+          <h2>Progress / Debug</h2>
           <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
           <div class="progress-text"><span id="progressCurrent">0</span> / <span id="progressTotal">0</span> <span id="progressLabel">images</span></div>
           <div id="progressStatus" class="progress-status">Initializing...</div>

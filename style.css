@@ -441,7 +441,7 @@ textarea {
   margin-top: var(--space-xs);
 }
 .progress-log {
-  max-height: 200px;
+  max-height: 320px;
   overflow-y: auto;
   background: var(--bg-primary);
   border-radius: var(--radius-sm);
@@ -454,6 +454,7 @@ textarea {
 .log-info { color: var(--text-secondary); }
 .log-success { color: var(--success); }
 .log-error { color: var(--error); }
+.log-warn { color: var(--warning); }
 
 .loading {
   display: flex;

@@ -34,7 +34,13 @@ const server = load('server.py');
 assert.match(server, /vertexai=True/);
 assert.match(server, /genai\.Client/);
 assert.match(server, /OSV_PROJECT_ID/);
+assert.match(server, /\/api\/logs/);
+assert.match(server, /def log\(/);
 assert.doesNotMatch(server, /GEMINI_API_KEY|print-access-token/);
+
+const geminiSrc = load('gemini.js');
+assert.match(geminiSrc, /setDebugSink/);
+assert.match(geminiSrc, /clientRequestId/);
 
 assert.deepEqual(gemini.parseJsonArray('[{"prompt":"x"}]'), [{ prompt: 'x' }]);
 

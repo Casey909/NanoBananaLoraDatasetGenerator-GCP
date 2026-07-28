@@ -9,6 +9,8 @@ import {
   hasCredentials,
   refreshProxyHealth,
   getProxyHealth,
+  fetchServerLogs,
+  setDebugSink,
   generateImage,
   generateText,
   parseJsonArray,
@@ -30,6 +32,7 @@ const state = {
   referenceImageBase64: null,
   characterRefs: {}, // slotId -> dataUrl
   importedImages: [],
+  clientLogs: [], // ring buffer for downloadable debug logs
 };
 
 const DEFAULT_SYSTEM_PROMPTS = {
@@ -315,6 +318,7 @@ function syncResolutionOptions() {
 // =============================================================================
 
 async function fileToCompressedDataUrl(file, maxSide = 1536) {
+  addDebugLog('DEBUG', 'upload.read_start', { name: file?.name, type: file?.type, size: file?.size });
   const rawUrl = await new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(reader.result);
@@ -337,8 +341,17 @@ async function fileToCompressedDataUrl(file, maxSide = 1536) {
     canvas.height = h;
     const ctx = canvas.getContext('2d');
     ctx.drawImage(img, 0, 0, w, h);
-    return canvas.toDataURL('image/jpeg', 0.88);
-  } catch {
+    const out = canvas.toDataURL('image/jpeg', 0.88);
+    addDebugLog('INFO', 'upload.compressed', {
+      name: file?.name,
+      from: `${img.width}x${img.height}`,
+      to: `${w}x${h}`,
+      inChars: String(rawUrl).length,
+      outChars: out.length,
+    });
+    return out;
+  } catch (e) {
+    addDebugLog('WARN', 'upload.compress_failed_use_raw', { name: file?.name, error: String(e?.message || e) });
     return rawUrl;
   }
 }
@@ -543,17 +556,108 @@ function updateProgress(current, total, status) {
   document.getElementById('progressStatus').textContent = status;
 }
 
+function verboseDebugEnabled() {
+  return document.getElementById('verboseDebug')?.checked !== false;
+}
+
+function pushClientLog(level, message, meta = {}) {
+  const entry = {
+    ts: new Date().toISOString(),
+    level,
+    message,
+    ...meta,
+  };
+  state.clientLogs.push(entry);
+  if (state.clientLogs.length > 2000) state.clientLogs.splice(0, state.clientLogs.length - 2000);
+  return entry;
+}
+
 function addProgressLog(message, type = 'info') {
+  const level = type === 'error' ? 'ERROR' : type === 'success' ? 'INFO' : type === 'warn' ? 'WARN' : 'INFO';
+  pushClientLog(level, message, { ui: true });
   const log = document.getElementById('progressLog');
+  if (!log) return;
   const entry = document.createElement('div');
   entry.className = `log-entry log-${type}`;
-  entry.textContent = message;
+  const ts = new Date().toLocaleTimeString();
+  entry.textContent = `[${ts}] ${message}`;
   log.appendChild(entry);
+  // Keep DOM from exploding on long auto-resume runs.
+  while (log.children.length > 400) log.removeChild(log.firstChild);
   log.scrollTop = log.scrollHeight;
 }
 
+function addDebugLog(level, message, meta = {}) {
+  pushClientLog(level, message, meta);
+  if (!verboseDebugEnabled() && level === 'DEBUG') return;
+  const type = level === 'ERROR' ? 'error' : level === 'WARN' ? 'warn' : 'info';
+  const extra = meta && Object.keys(meta).length
+    ? ` | ${truncate(JSON.stringify(meta), 180)}`
+    : '';
+  addProgressLog(`[dbg] ${message}${extra}`, type);
+}
+
 function clearProgressLog() {
-  document.getElementById('progressLog').innerHTML = '';
+  const log = document.getElementById('progressLog');
+  if (log) log.innerHTML = '';
+}
+
+async function downloadDebugLogs() {
+  showProgress(true);
+  addProgressLog('Collecting client + server logs…', 'info');
+  let serverLogs = [];
+  let serverMeta = {};
+  try {
+    const payload = await fetchServerLogs(300);
+    serverLogs = payload.logs || [];
+    serverMeta = { logFile: payload.logFile, count: payload.count };
+  } catch (e) {
+    addProgressLog(`Server logs unavailable: ${e.message}`, 'error');
+  }
+
+  const blob = new Blob(
+    [
+      JSON.stringify(
+        {
+          exportedAt: new Date().toISOString(),
+          health: getProxyHealth(),
+          serverMeta,
+          clientLogs: state.clientLogs,
+          serverLogs,
+          ui: {
+            mode: state.mode,
+            imageModel: getImageModelId(),
+            llmModel: getLlmModelId(),
+            pairsInMemory: state.pairs.length,
+            characterRefSlots: Object.keys(state.characterRefs),
+          },
+        },
+        null,
+        2
+      ),
+    ],
+    { type: 'application/json' }
+  );
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `lora_debug_logs_${Date.now()}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+  addProgressLog('Debug logs downloaded', 'success');
+}
+
+async function refreshServerLogsIntoUi() {
+  try {
+    const payload = await fetchServerLogs(40);
+    addProgressLog(`Server log file: ${payload.logFile || 'n/a'} (${payload.count || 0} in memory)`, 'info');
+    for (const row of (payload.logs || []).slice(-20)) {
+      const type = row.level === 'ERROR' ? 'error' : row.level === 'WARN' ? 'warn' : 'info';
+      addProgressLog(`[srv ${row.event}] ${truncate(JSON.stringify(row), 200)}`, type);
+    }
+  } catch (e) {
+    addProgressLog(`Could not fetch /api/logs: ${e.message}`, 'error');
+  }
 }
 
 function addResultCard(item) {
@@ -1096,6 +1200,24 @@ function populateModelSelects() {
 }
 
 async function init() {
+  setDebugSink((level, message, meta) => {
+    // Avoid recursive UI spam: gemini logs already go through addDebugLog formatting.
+    pushClientLog(level, message, meta);
+    if (!verboseDebugEnabled() && level === 'DEBUG') return;
+    const type = level === 'ERROR' ? 'error' : level === 'WARN' ? 'warn' : 'info';
+    const log = document.getElementById('progressLog');
+    if (!log) return;
+    // Only mirror gemini transport logs when progress panel exists / verbose on.
+    if (verboseDebugEnabled() || level === 'ERROR' || level === 'WARN') {
+      const entry = document.createElement('div');
+      entry.className = `log-entry log-${type}`;
+      entry.textContent = `[${new Date().toLocaleTimeString()}] [api] ${message}${meta?.reqId || meta?.clientRequestId ? ` (${meta.reqId || meta.clientRequestId})` : ''}`;
+      log.appendChild(entry);
+      while (log.children.length > 400) log.removeChild(log.firstChild);
+      log.scrollTop = log.scrollHeight;
+    }
+  });
+
   populateModelSelects();
   syncResolutionOptions();
   renderCharacterSlots();
@@ -1103,6 +1225,9 @@ async function init() {
   // Clear old browser API-key / pasted-token settings from earlier builds.
   ['gcp_lora_provider', 'gcp_lora_api_key', 'gcp_lora_project', 'gcp_lora_location', 'gcp_lora_access_token', 'gcp_lora_use_proxy']
     .forEach((k) => localStorage.removeItem(k));
+
+  showProgress(true);
+  addProgressLog('Debug logging enabled — use Download Debug Logs after failures', 'info');
 
   const ready = await refreshAuthStatus();
   if (!ready) setTimeout(() => showApiKeyModal(), 400);
@@ -1148,5 +1273,7 @@ window.handleReferenceUpload = handleReferenceUpload;
 window.clearReference = clearReference;
 window.handleImportUpload = handleImportUpload;
 window.clearImportedImages = clearImportedImages;
+window.downloadDebugLogs = downloadDebugLogs;
+window.refreshServerLogsIntoUi = refreshServerLogsIntoUi;
 
 document.addEventListener('DOMContentLoaded', init);
