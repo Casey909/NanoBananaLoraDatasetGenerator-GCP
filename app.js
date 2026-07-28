@@ -95,25 +95,305 @@ function fileToCompressedDataUrl(file, maxSide = 1536) {
     reader.onload = async () => {
       try {
         const rawUrl = reader.result;
-        const img = await new Promise((res, rej) => {
-          const el = new Image();
-          el.onload = () => res(el);
-          el.onerror = rej;
-          el.src = rawUrl;
-        });
-        const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
-        const w = Math.max(1, Math.round(img.width * scale));
-        const h = Math.max(1, Math.round(img.height * scale));
-        const canvas = document.createElement('canvas');
-        canvas.width = w;
-        canvas.height = h;
-        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-        resolve(canvas.toDataURL('image/jpeg', 0.88));
+        const img = await loadImage(rawUrl);
+        resolve(compressImageElement(img, maxSide));
       } catch {
         resolve(reader.result);
       }
     };
     reader.readAsDataURL(file);
+  });
+}
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const el = new Image();
+    el.onload = () => resolve(el);
+    el.onerror = reject;
+    el.src = src;
+  });
+}
+
+function compressImageElement(img, maxSide = 1536, quality = 0.88) {
+  const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+  const w = Math.max(1, Math.round(img.width * scale));
+  const h = Math.max(1, Math.round(img.height * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+  return canvas.toDataURL('image/jpeg', quality);
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = reject;
+    reader.onload = () => resolve(reader.result);
+    reader.readAsDataURL(file);
+  });
+}
+
+/** Interactive crop → compressed JPEG data URL, or null if cancelled. */
+function openCropModal(file, { title = 'Crop reference' } = {}) {
+  return new Promise(async (resolve) => {
+    const modal = $('cropModal');
+    const stage = $('cropStage');
+    const imgEl = $('cropImage');
+    const box = $('cropBox');
+    const aspectSel = $('cropAspect');
+    if (!modal || !stage || !imgEl || !box) {
+      // Fallback: no UI → compress full image
+      resolve(await fileToCompressedDataUrl(file));
+      return;
+    }
+
+    $('cropTitle').textContent = title;
+    aspectSel.value = '1';
+    const rawUrl = await readFileAsDataUrl(file);
+    const natural = await loadImage(rawUrl);
+    imgEl.src = rawUrl;
+
+    // crop rect in displayed CSS pixels relative to stage
+    const stateCrop = {
+      x: 0,
+      y: 0,
+      w: 0,
+      h: 0,
+      drag: null, // { mode, startX, startY, orig }
+      settled: false,
+    };
+
+    const aspectRatio = () => {
+      const v = aspectSel.value;
+      return v === 'free' ? null : Number(v);
+    };
+
+    const clampCrop = () => {
+      const iw = imgEl.clientWidth;
+      const ih = imgEl.clientHeight;
+      const min = 40;
+      stateCrop.w = Math.max(min, Math.min(stateCrop.w, iw));
+      stateCrop.h = Math.max(min, Math.min(stateCrop.h, ih));
+      const ar = aspectRatio();
+      if (ar) {
+        // keep aspect, prefer width then adjust height
+        if (stateCrop.w / stateCrop.h > ar) {
+          stateCrop.w = stateCrop.h * ar;
+        } else {
+          stateCrop.h = stateCrop.w / ar;
+        }
+        if (stateCrop.w > iw) {
+          stateCrop.w = iw;
+          stateCrop.h = iw / ar;
+        }
+        if (stateCrop.h > ih) {
+          stateCrop.h = ih;
+          stateCrop.w = ih * ar;
+        }
+      }
+      stateCrop.x = Math.max(0, Math.min(stateCrop.x, iw - stateCrop.w));
+      stateCrop.y = Math.max(0, Math.min(stateCrop.y, ih - stateCrop.h));
+    };
+
+    const paintBox = () => {
+      clampCrop();
+      box.style.left = `${stateCrop.x}px`;
+      box.style.top = `${stateCrop.y}px`;
+      box.style.width = `${stateCrop.w}px`;
+      box.style.height = `${stateCrop.h}px`;
+    };
+
+    const initCrop = () => {
+      const iw = imgEl.clientWidth;
+      const ih = imgEl.clientHeight;
+      if (!iw || !ih) return;
+      const ar = aspectRatio() || 1;
+      const side = Math.min(iw, ih) * 0.85;
+      let w = side;
+      let h = side / ar;
+      if (h > ih * 0.9) {
+        h = ih * 0.9;
+        w = h * ar;
+      }
+      if (w > iw * 0.9) {
+        w = iw * 0.9;
+        h = w / (aspectRatio() || w / h);
+      }
+      stateCrop.w = w;
+      stateCrop.h = h;
+      stateCrop.x = (iw - w) / 2;
+      stateCrop.y = (ih - h) / 2;
+      paintBox();
+      stateCrop.settled = true;
+    };
+
+    const finish = (dataUrl) => {
+      cleanup();
+      modal.classList.add('hidden');
+      imgEl.removeAttribute('src');
+      resolve(dataUrl);
+    };
+
+    const onPointerDown = (e) => {
+      const handle = e.target?.dataset?.handle;
+      const rect = stage.getBoundingClientRect();
+      const clientX = e.clientX ?? e.touches?.[0]?.clientX;
+      const clientY = e.clientY ?? e.touches?.[0]?.clientY;
+      const px = clientX - rect.left;
+      const py = clientY - rect.top;
+      stateCrop.drag = {
+        mode: handle || 'move',
+        startX: px,
+        startY: py,
+        orig: { x: stateCrop.x, y: stateCrop.y, w: stateCrop.w, h: stateCrop.h },
+      };
+      e.preventDefault();
+      try {
+        (e.currentTarget || box).setPointerCapture?.(e.pointerId);
+      } catch {
+        /* ignore */
+      }
+    };
+
+    const onPointerMove = (e) => {
+      if (!stateCrop.drag) return;
+      const rect = stage.getBoundingClientRect();
+      const clientX = e.clientX ?? e.touches?.[0]?.clientX;
+      const clientY = e.clientY ?? e.touches?.[0]?.clientY;
+      if (clientX == null) return;
+      const px = clientX - rect.left;
+      const py = clientY - rect.top;
+      const dx = px - stateCrop.drag.startX;
+      const dy = py - stateCrop.drag.startY;
+      const o = stateCrop.drag.orig;
+      const mode = stateCrop.drag.mode;
+      const ar = aspectRatio();
+      const iw = imgEl.clientWidth;
+      const ih = imgEl.clientHeight;
+
+      if (mode === 'move') {
+        stateCrop.x = o.x + dx;
+        stateCrop.y = o.y + dy;
+      } else {
+        let x = o.x;
+        let y = o.y;
+        let w = o.w;
+        let h = o.h;
+        if (mode.includes('e')) w = o.w + dx;
+        if (mode.includes('s')) h = o.h + dy;
+        if (mode.includes('w')) {
+          x = o.x + dx;
+          w = o.w - dx;
+        }
+        if (mode.includes('n')) {
+          y = o.y + dy;
+          h = o.h - dy;
+        }
+        if (ar) {
+          if (mode === 'n' || mode === 's') {
+            w = h * ar;
+            x = o.x + (o.w - w) / 2;
+          } else if (mode === 'e' || mode === 'w') {
+            h = w / ar;
+            y = o.y + (o.h - h) / 2;
+          } else if (mode === 'se' || mode === 'ne') {
+            h = w / ar;
+            if (mode === 'ne') y = o.y + o.h - h;
+          } else if (mode === 'sw' || mode === 'nw') {
+            w = Math.max(40, w);
+            h = w / ar;
+            x = o.x + o.w - w;
+            if (mode === 'nw') y = o.y + o.h - h;
+          }
+        }
+        stateCrop.x = x;
+        stateCrop.y = y;
+        stateCrop.w = Math.max(40, w);
+        stateCrop.h = Math.max(40, h);
+        if (stateCrop.x < 0) {
+          stateCrop.w += stateCrop.x;
+          stateCrop.x = 0;
+        }
+        if (stateCrop.y < 0) {
+          stateCrop.h += stateCrop.y;
+          stateCrop.y = 0;
+        }
+        if (stateCrop.x + stateCrop.w > iw) stateCrop.w = iw - stateCrop.x;
+        if (stateCrop.y + stateCrop.h > ih) stateCrop.h = ih - stateCrop.y;
+      }
+      paintBox();
+      e.preventDefault();
+    };
+
+    const onPointerUp = () => {
+      stateCrop.drag = null;
+    };
+
+    const applyCrop = (full = false) => {
+      const canvas = document.createElement('canvas');
+      if (full) {
+        canvas.width = natural.width;
+        canvas.height = natural.height;
+        canvas.getContext('2d').drawImage(natural, 0, 0);
+      } else {
+        const scaleX = natural.width / imgEl.clientWidth;
+        const scaleY = natural.height / imgEl.clientHeight;
+        const sx = Math.round(stateCrop.x * scaleX);
+        const sy = Math.round(stateCrop.y * scaleY);
+        const sw = Math.max(1, Math.round(stateCrop.w * scaleX));
+        const sh = Math.max(1, Math.round(stateCrop.h * scaleY));
+        canvas.width = sw;
+        canvas.height = sh;
+        canvas.getContext('2d').drawImage(natural, sx, sy, sw, sh, 0, 0, sw, sh);
+      }
+      // compress via temp image
+      const tmp = new Image();
+      tmp.onload = () => finish(compressImageElement(tmp, 1536));
+      tmp.onerror = () => finish(canvas.toDataURL('image/jpeg', 0.88));
+      tmp.src = canvas.toDataURL('image/jpeg', 0.92);
+    };
+
+    const onAspect = () => initCrop();
+    const onReset = () => initCrop();
+    const onCancel = () => finish(null);
+    const onFull = () => applyCrop(true);
+    const onApply = () => applyCrop(false);
+    const onKey = (e) => {
+      if (e.key === 'Escape') onCancel();
+      if (e.key === 'Enter') onApply();
+    };
+
+    function cleanup() {
+      box.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('pointercancel', onPointerUp);
+      aspectSel.removeEventListener('change', onAspect);
+      $('cropResetBtn')?.removeEventListener('click', onReset);
+      $('cropCancelBtn')?.removeEventListener('click', onCancel);
+      $('cropFullBtn')?.removeEventListener('click', onFull);
+      $('cropApplyBtn')?.removeEventListener('click', onApply);
+      window.removeEventListener('keydown', onKey);
+    }
+
+    box.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('pointermove', onPointerMove, { passive: false });
+    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerUp);
+    aspectSel.addEventListener('change', onAspect);
+    $('cropResetBtn')?.addEventListener('click', onReset);
+    $('cropCancelBtn')?.addEventListener('click', onCancel);
+    $('cropFullBtn')?.addEventListener('click', onFull);
+    $('cropApplyBtn')?.addEventListener('click', onApply);
+    window.addEventListener('keydown', onKey);
+
+    modal.classList.remove('hidden');
+    // wait layout then init
+    requestAnimationFrame(() => {
+      if (imgEl.complete) initCrop();
+      else imgEl.onload = () => initCrop();
+    });
   });
 }
 
@@ -171,6 +451,7 @@ function renderCharacterSlots() {
     zone.addEventListener('click', () => input.click());
     input.addEventListener('change', async (e) => {
       const file = e.target.files?.[0];
+      input.value = '';
       if (!file) return;
       await uploadRef(slot.id, file);
     });
@@ -193,10 +474,25 @@ async function ensureCharacter() {
 }
 
 async function uploadRef(slot, file) {
+  if (!$('characterName').value.trim()) {
+    alert('Enter a character name first');
+    return;
+  }
   showProgress(true);
+  addProgressLog(`Crop ${slot}…`, 'info');
+  let dataUrl;
+  try {
+    dataUrl = await openCropModal(file, { title: `Crop · ${slot}` });
+  } catch (e) {
+    addProgressLog(`Crop failed: ${e.message}`, 'error');
+    return;
+  }
+  if (!dataUrl) {
+    addProgressLog(`Crop cancelled for ${slot}`, 'warn');
+    return;
+  }
   addProgressLog(`Uploading ${slot} to character folder…`, 'info');
   await ensureCharacter();
-  const dataUrl = await fileToCompressedDataUrl(file);
   const result = await api(`/api/characters/${encodeURIComponent(state.characterSlug)}/refs`, {
     method: 'POST',
     body: JSON.stringify({ slot, dataUrl }),

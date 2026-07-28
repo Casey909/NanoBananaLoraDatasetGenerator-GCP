@@ -34,9 +34,11 @@ assert.match(app, /beforeunload/);
 assert.match(app, /startPolling/);
 assert.match(app, /Regenerate/);
 assert.match(app, /\/api\/jobs/);
+assert.match(app, /openCropModal/);
 
 const html = load('index.html');
 assert.match(html, /Start Backend Job/);
 assert.match(html, /data\/characters/);
+assert.match(html, /cropModal/);
 
 console.log('selfcheck OK');

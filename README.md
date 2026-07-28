@@ -39,6 +39,7 @@ data/characters/<slug>/
 - Live log/status polling (survives page hide)
 - Per-image refine textarea + Regenerate
 - beforeunload confirm while a job is active
+- Crop tool on reference upload (aspect presets, drag/resize)
 - ZIP download from saved folder files
 
 ## Models

@@ -527,6 +527,82 @@ textarea {
   gap: var(--space-md);
   justify-content: flex-end;
   margin-top: var(--space-xl);
+  flex-wrap: wrap;
+}
+
+.crop-modal-content {
+  max-width: min(920px, 96vw);
+  max-height: 94vh;
+  overflow: auto;
+}
+.crop-toolbar {
+  display: flex;
+  gap: var(--space-md);
+  align-items: center;
+  margin-bottom: var(--space-md);
+  flex-wrap: wrap;
+}
+.crop-toolbar label {
+  display: flex;
+  gap: var(--space-sm);
+  align-items: center;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+.crop-toolbar select {
+  min-width: 6rem;
+}
+.crop-stage {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  max-height: min(62vh, 720px);
+  user-select: none;
+  touch-action: none;
+  line-height: 0;
+  background: #111;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.crop-stage img {
+  display: block;
+  max-width: 100%;
+  max-height: min(62vh, 720px);
+  width: auto;
+  height: auto;
+  pointer-events: none;
+}
+.crop-box {
+  position: absolute;
+  border: 2px solid var(--accent, #5b9fff);
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55);
+  cursor: move;
+  box-sizing: border-box;
+}
+.crop-handle {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  background: #fff;
+  border: 2px solid var(--accent, #5b9fff);
+  border-radius: 2px;
+  box-sizing: border-box;
+}
+.crop-handle.nw { left: -7px; top: -7px; cursor: nwse-resize; }
+.crop-handle.ne { right: -7px; top: -7px; cursor: nesw-resize; }
+.crop-handle.sw { left: -7px; bottom: -7px; cursor: nesw-resize; }
+.crop-handle.se { right: -7px; bottom: -7px; cursor: nwse-resize; }
+.crop-handle.n { left: 50%; top: -7px; transform: translateX(-50%); cursor: ns-resize; }
+.crop-handle.s { left: 50%; bottom: -7px; transform: translateX(-50%); cursor: ns-resize; }
+.crop-handle.w { left: -7px; top: 50%; transform: translateY(-50%); cursor: ew-resize; }
+.crop-handle.e { right: -7px; top: 50%; transform: translateY(-50%); cursor: ew-resize; }
+
+@media (max-width: 640px) {
+  .crop-handle { width: 18px; height: 18px; }
+  .crop-handle.nw, .crop-handle.sw, .crop-handle.w { left: -9px; }
+  .crop-handle.ne, .crop-handle.se, .crop-handle.e { right: -9px; }
+  .crop-handle.nw, .crop-handle.ne, .crop-handle.n { top: -9px; }
+  .crop-handle.sw, .crop-handle.se, .crop-handle.s { bottom: -9px; }
 }
 .header-actions { display: flex; align-items: center; gap: var(--space-md); }
 .api-key-input { display: flex; gap: var(--space-sm); }
