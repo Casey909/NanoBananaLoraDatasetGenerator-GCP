@@ -210,8 +210,8 @@
 
           <div class="form-group">
             <label for="maxConcurrent">Parallel requests</label>
-            <input id="maxConcurrent" type="number" min="1" max="10" value="2" />
-            <small>Start low (1–2) to avoid rate limits</small>
+            <input id="maxConcurrent" type="number" min="1" max="10" value="1" />
+            <small>Use 1 to avoid 429 quota errors; increase only if stable</small>
           </div>
 
           <div class="form-group">

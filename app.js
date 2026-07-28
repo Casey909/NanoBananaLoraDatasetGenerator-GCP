@@ -65,6 +65,8 @@ function truncate(str, length) {
 function isRetryableError(err) {
   const msg = String(err?.message || err || '');
   const status = err?.status;
+  // Do not endlessly retry INVALID_ARGUMENT — payload must be fixed.
+  if (/INVALID_ARGUMENT|invalid argument/i.test(msg) || status === 400) return false;
   return (
     status === 429 ||
     status === 408 ||
@@ -312,20 +314,50 @@ function syncResolutionOptions() {
 // Uploads
 // =============================================================================
 
-function handleReferenceUpload(event) {
+async function fileToCompressedDataUrl(file, maxSide = 1536) {
+  const rawUrl = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = reject;
+      el.src = rawUrl;
+    });
+    const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+    const w = Math.max(1, Math.round(img.width * scale));
+    const h = Math.max(1, Math.round(img.height * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, w, h);
+    return canvas.toDataURL('image/jpeg', 0.88);
+  } catch {
+    return rawUrl;
+  }
+}
+
+async function handleReferenceUpload(event) {
   const file = event.target.files[0];
   if (!file) return;
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    state.referenceImageBase64 = e.target.result;
+  try {
+    const dataUrl = await fileToCompressedDataUrl(file);
+    state.referenceImageBase64 = dataUrl;
     const preview = document.getElementById('referencePreview');
     const placeholder = document.getElementById('uploadPlaceholder');
-    preview.src = e.target.result;
+    preview.src = dataUrl;
     preview.classList.remove('hidden');
     placeholder.classList.add('hidden');
     document.getElementById('clearRefBtn').style.display = 'block';
-  };
-  reader.readAsDataURL(file);
+  } catch (e) {
+    alert(`Failed to read image: ${e.message || e}`);
+  }
 }
 
 function clearReference() {
@@ -338,21 +370,22 @@ function clearReference() {
   document.getElementById('referenceInput').value = '';
 }
 
-function handleCharacterRefUpload(slotId, event) {
+async function handleCharacterRefUpload(slotId, event) {
   const file = event.target.files?.[0];
   if (!file) return;
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    state.characterRefs[slotId] = e.target.result;
+  try {
+    const dataUrl = await fileToCompressedDataUrl(file);
+    state.characterRefs[slotId] = dataUrl;
     const preview = document.getElementById(`char-preview-${slotId}`);
     const placeholder = document.getElementById(`char-ph-${slotId}`);
     if (preview) {
-      preview.src = e.target.result;
+      preview.src = dataUrl;
       preview.classList.remove('hidden');
     }
     if (placeholder) placeholder.classList.add('hidden');
-  };
-  reader.readAsDataURL(file);
+  } catch (e) {
+    alert(`Failed to read ${slotId}: ${e.message || e}`);
+  }
 }
 
 function clearCharacterRef(slotId) {

@@ -7,20 +7,20 @@ export const IMAGE_MODELS = {
   'gemini-3.1-flash-image': {
     id: 'gemini-3.1-flash-image',
     label: 'Nano Banana 2',
-    sizes: ['0.5K', '1K', '2K', '4K'],
-    maxRefs: 14,
+    sizes: ['1K', '2K', '4K'],
+    maxRefs: 4,
   },
   'gemini-3.1-flash-lite-image': {
     id: 'gemini-3.1-flash-lite-image',
     label: 'Nano Banana 2 Lite',
     sizes: ['1K'],
-    maxRefs: 4,
+    maxRefs: 3,
   },
   'gemini-3-pro-image': {
     id: 'gemini-3-pro-image',
     label: 'Nano Banana Pro',
     sizes: ['1K', '2K', '4K'],
-    maxRefs: 14,
+    maxRefs: 4,
   },
 };
 
@@ -125,7 +125,11 @@ async function postJson(path, payload, maxRetries = 5) {
         (error.status && error.status >= 500) ||
         /fetch|network|timeout|RESOURCE_EXHAUSTED|UNAVAILABLE/i.test(error.message || '');
       if (retryable && attempt < maxRetries) {
-        await sleep(attempt * 2000);
+        // Longer backoff on 429 / RESOURCE_EXHAUSTED.
+        const base = /429|RESOURCE_EXHAUSTED/i.test(error.message || '') || error.status === 429
+          ? 8000
+          : 2000;
+        await sleep(attempt * base);
         continue;
       }
       throw error;
