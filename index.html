@@ -214,6 +214,14 @@
             <small>Start low (1–2) to avoid rate limits</small>
           </div>
 
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="autoResumeFailed" checked />
+              Auto-resume failed requests
+            </label>
+            <small>Retries 429 / quota / network failures with backoff until all succeed or you Stop</small>
+          </div>
+
           <div class="auto-actions">
             <button class="btn btn-generate" type="button" onclick="startGeneration()">Start Generation</button>
             <button class="btn btn-secondary" type="button" onclick="stopGeneration()">Stop</button>

@@ -62,6 +62,114 @@ function truncate(str, length) {
   return str.length > length ? `${str.substring(0, length)}...` : str;
 }
 
+function isRetryableError(err) {
+  const msg = String(err?.message || err || '');
+  const status = err?.status;
+  return (
+    status === 429 ||
+    status === 408 ||
+    (status && status >= 500) ||
+    /429|RESOURCE_EXHAUSTED|UNAVAILABLE|timeout|fetch|network|503|502|500/i.test(msg)
+  );
+}
+
+function autoResumeEnabled() {
+  return document.getElementById('autoResumeFailed')?.checked !== false;
+}
+
+/**
+ * Run jobs in batches; retryable failures are re-queued until success or Stop.
+ * jobs: [{ key, run: () => Promise<result>, onSuccess?(value) }]
+ */
+async function runJobsWithAutoResume(jobs, { maxConcurrent, label = 'items' }) {
+  let pending = jobs.map((job, index) => ({ ...job, index, attempts: 0 }));
+  let completed = 0;
+  let permanentFailed = 0;
+  let round = 0;
+  const total = jobs.length;
+
+  updateProgress(0, total, `0/${total} ${label}`);
+
+  while (pending.length && state.isGenerating) {
+    round += 1;
+    // After first wave, slow down to ease quota pressure.
+    const concurrent = round === 1 ? maxConcurrent : Math.max(1, Math.min(2, maxConcurrent));
+    const wave = pending;
+    pending = [];
+    const retryQueue = [];
+
+    for (let i = 0; i < wave.length; i += concurrent) {
+      if (!state.isGenerating) {
+        pending.push(...wave.slice(i), ...retryQueue);
+        retryQueue.length = 0;
+        break;
+      }
+
+      const batch = wave.slice(i, i + concurrent);
+      const results = await Promise.allSettled(batch.map((job) => job.run()));
+
+      for (let j = 0; j < results.length; j++) {
+        const job = batch[j];
+        const result = results[j];
+        job.attempts += 1;
+
+        if (result.status === 'fulfilled') {
+          completed += 1;
+          job.onSuccess?.(result.value, job);
+          updateProgress(completed, total, `${completed}/${total} done`);
+          continue;
+        }
+
+        const errMsg = result.reason?.message || 'error';
+        addProgressLog(
+          `${job.key} failed (try ${job.attempts}): ${truncate(errMsg, 140)}`,
+          'error'
+        );
+
+        if (isRetryableError(result.reason) && autoResumeEnabled()) {
+          retryQueue.push(job);
+        } else if (isRetryableError(result.reason) && !autoResumeEnabled()) {
+          permanentFailed += 1;
+          addProgressLog(`${job.key} left failed (auto-resume off)`, 'error');
+        } else {
+          permanentFailed += 1;
+          addProgressLog(`${job.key} skipped (not retryable)`, 'error');
+        }
+      }
+
+      updateProgress(completed, total, `${completed}/${total} done · ${retryQueue.length} to resume`);
+    }
+
+    if (!state.isGenerating) break;
+    if (!retryQueue.length) break;
+
+    const delaySec = Math.min(120, 10 * 2 ** Math.min(round - 1, 4));
+    addProgressLog(
+      `Auto-resume: ${retryQueue.length} failed — retry in ${delaySec}s (round ${round + 1}, parallel ${concurrent})…`,
+      'info'
+    );
+
+    for (let t = delaySec; t > 0 && state.isGenerating; t -= 1) {
+      updateProgress(completed, total, `Resume in ${t}s (${retryQueue.length} left)`);
+      await sleep(1000);
+    }
+
+    if (!state.isGenerating) {
+      pending = retryQueue;
+      break;
+    }
+
+    pending = retryQueue;
+  }
+
+  const leftover = pending.length + permanentFailed;
+  return {
+    completed,
+    failed: leftover,
+    stopped: !state.isGenerating && pending.length > 0,
+  };
+}
+
 // =============================================================================
 // Auth status (Vertex ADC via local server.py — same as onestopvideo)
 // =============================================================================
@@ -751,10 +859,10 @@ async function startGeneration() {
   clearProgressLog();
   updateProgress(0, numPairs, 'Generating prompts...');
   addProgressLog('Generating prompts...', 'info');
+  if (autoResumeEnabled()) {
+    addProgressLog('Auto-resume ON — 429/quota failures will retry until done or Stop', 'info');
+  }
   state.isGenerating = true;
-
-  let completed = 0;
-  let failed = 0;
 
   try {
     const refs =
@@ -771,49 +879,41 @@ async function startGeneration() {
     const prompts = await generatePromptsWithLLM(theme, transformation, actionName, numPairs, llmModel);
     addProgressLog(`Got ${prompts.length} prompts`, 'success');
 
-    for (let i = 0; i < prompts.length; i += maxConcurrent) {
-      if (!state.isGenerating) break;
-      const batch = prompts.slice(i, Math.min(i + maxConcurrent, prompts.length));
+    const jobs = prompts.map((prompt, index) => ({
+      key: `[${index + 1}/${prompts.length}]`,
+      run: () =>
+        currentMode === 'pair'
+          ? generatePairItem(prompt, index, prompts.length, aspectRatio, resolution, useVision, llmModel, triggerWord)
+          : generateSingleItem(prompt, index, prompts.length, aspectRatio, resolution, useVision, llmModel, triggerWord, refs),
+      onSuccess: (value) => {
+        state.pairCounter += 1;
+        const item = {
+          id: String(state.pairCounter).padStart(4, '0'),
+          mode: currentMode === 'pair' ? 'pair' : 'single',
+          ...value,
+        };
+        state.pairs.push(item);
+        addResultCard(item);
+        updatePairCount();
+        addProgressLog(`#${item.id} complete`, 'success');
+      },
+    }));
 
-      let results;
-      if (currentMode === 'pair') {
-        results = await Promise.allSettled(
-          batch.map((p, bi) =>
-            generatePairItem(p, i + bi, prompts.length, aspectRatio, resolution, useVision, llmModel, triggerWord)
-          )
-        );
-      } else {
-        results = await Promise.allSettled(
-          batch.map((p, bi) =>
-            generateSingleItem(p, i + bi, prompts.length, aspectRatio, resolution, useVision, llmModel, triggerWord, refs)
-          )
-        );
-      }
+    const { completed, failed, stopped } = await runJobsWithAutoResume(jobs, {
+      maxConcurrent,
+      label: modeLabel,
+    });
 
-      for (let j = 0; j < results.length; j++) {
-        const result = results[j];
-        if (result.status === 'fulfilled') {
-          state.pairCounter += 1;
-          const item = {
-            id: String(state.pairCounter).padStart(4, '0'),
-            mode: currentMode === 'pair' ? 'pair' : 'single',
-            ...result.value,
-          };
-          state.pairs.push(item);
-          addResultCard(item);
-          updatePairCount();
-          completed += 1;
-          addProgressLog(`#${item.id} complete`, 'success');
-        } else {
-          failed += 1;
-          addProgressLog(`${i + j + 1} failed: ${result.reason?.message || 'error'}`, 'error');
-        }
-        updateProgress(completed + failed, prompts.length, `${completed}/${prompts.length} done`);
-      }
+    if (stopped) {
+      updateProgress(completed, prompts.length, 'Stopped');
+      addProgressLog(`Stopped: ${completed} ok, ${failed} still pending`, 'info');
+    } else if (failed) {
+      updateProgress(completed, prompts.length, 'Finished with failures');
+      addProgressLog(`Done: ${completed} ok, ${failed} failed (auto-resume off or not retryable)`, 'error');
+    } else {
+      updateProgress(prompts.length, prompts.length, 'Complete');
+      addProgressLog(`Done: ${completed} ok — all succeeded`, 'success');
     }
-
-    updateProgress(prompts.length, prompts.length, 'Complete');
-    addProgressLog(`Done: ${completed} ok${failed ? `, ${failed} failed` : ''}`, 'success');
     addProgressLog('Click Download ZIP to save', 'info');
   } catch (error) {
     addProgressLog(`Error: ${error.message}`, 'error');
@@ -833,42 +933,42 @@ async function runImportEdit(maxConcurrent, resolution, useVision, llmModel, tri
   showProgress(true);
   clearProgressLog();
   updateProgress(0, totalImages, 'Starting edits...');
+  if (autoResumeEnabled()) {
+    addProgressLog('Auto-resume ON — failed edits will retry until done or Stop', 'info');
+  }
   state.isGenerating = true;
 
-  let completed = 0;
-  let failed = 0;
-
   try {
-    for (let i = 0; i < imagesToProcess.length; i += maxConcurrent) {
-      if (!state.isGenerating) break;
-      const batch = imagesToProcess.slice(i, Math.min(i + maxConcurrent, totalImages));
-      const results = await Promise.allSettled(
-        batch.map((img, bi) =>
-          generateImportEditItem(img, importTransformation, i + bi, totalImages, resolution, useVision, llmModel, triggerWord)
-        )
-      );
+    const jobs = imagesToProcess.map((img, index) => ({
+      key: `[${index + 1}/${totalImages}] ${img.name}`,
+      run: () =>
+        generateImportEditItem(img, importTransformation, index, totalImages, resolution, useVision, llmModel, triggerWord),
+      onSuccess: (value) => {
+        state.pairCounter += 1;
+        const item = {
+          id: String(state.pairCounter).padStart(4, '0'),
+          mode: 'pair',
+          ...value,
+        };
+        state.pairs.push(item);
+        addResultCard(item);
+        updatePairCount();
+        addProgressLog(`#${item.id} ${value.originalName}`, 'success');
+      },
+    }));
 
-      for (const result of results) {
-        if (result.status === 'fulfilled') {
-          state.pairCounter += 1;
-          const item = {
-            id: String(state.pairCounter).padStart(4, '0'),
-            mode: 'pair',
-            ...result.value,
-          };
-          state.pairs.push(item);
-          addResultCard(item);
-          updatePairCount();
-          completed += 1;
-          addProgressLog(`#${item.id} ${result.value.originalName}`, 'success');
-        } else {
-          failed += 1;
-          addProgressLog(`Failed: ${result.reason?.message || 'error'}`, 'error');
-        }
-        updateProgress(completed + failed, totalImages, `${completed}/${totalImages} done`);
-      }
+    const { completed, failed, stopped } = await runJobsWithAutoResume(jobs, {
+      maxConcurrent,
+      label: 'images',
+    });
+
+    if (stopped) {
+      addProgressLog(`Stopped: ${completed} edited, ${failed} pending`, 'info');
+    } else if (failed) {
+      addProgressLog(`Done: ${completed} edited, ${failed} failed`, 'error');
+    } else {
+      addProgressLog(`Done: ${completed} edited — all succeeded`, 'success');
     }
-    addProgressLog(`Done: ${completed} edited${failed ? `, ${failed} failed` : ''}`, 'success');
   } catch (error) {
     addProgressLog(`Error: ${error.message}`, 'error');
     alert(`Error: ${error.message}`);

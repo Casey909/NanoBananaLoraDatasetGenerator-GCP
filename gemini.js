@@ -92,7 +92,7 @@ export function imageToObjectUrl(image) {
   return URL.createObjectURL(blob);
 }
 
-async function postJson(path, payload, maxRetries = 3) {
+async function postJson(path, payload, maxRetries = 5) {
   if (!proxyHealth) await refreshProxyHealth();
   if (!proxyHealth?.ok) {
     throw new Error(
