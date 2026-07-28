@@ -16,7 +16,7 @@
         <span class="logo-icon" aria-hidden="true">🍌</span>
         <div>
           <h1>GCP LoRA Character Dataset</h1>
-          <p class="logo-sub">Nano Banana 2 / Lite / Pro · Gemini Flash · Vertex or AI Studio</p>
+          <p class="logo-sub">Nano Banana 2 / Lite / Pro · Gemini Flash · Vertex ADC (onestopvideo path)</p>
         </div>
       </div>
       <div class="header-actions">
@@ -242,53 +242,17 @@
 
   <div id="apiKeyModal" class="modal hidden">
     <div class="modal-content">
-      <h2>GCP / Gemini credentials</h2>
+      <h2>Vertex ADC (same as onestopvideo)</h2>
       <p class="modal-desc">
-        Use a <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio API key</a>
-        or Vertex AI (project + access token). Stored only in this browser.
+        This app does not use API keys in the browser. The host runs
+        <code>python server.py</code>, which calls Vertex with
+        <code>google.genai</code> + Application Default Credentials
+        (<code>gcloud auth application-default login</code>), same as OneStopVideo.
       </p>
-
-      <div class="form-group">
-        <label for="providerSelect">Provider</label>
-        <select id="providerSelect" onchange="syncProviderFields()">
-          <option value="google-ai">Google AI Studio (API key)</option>
-          <option value="vertex">Vertex AI (GCP)</option>
-        </select>
-      </div>
-
-      <div id="googleAiFields">
-        <div class="form-group">
-          <label for="apiKeyInput">API key</label>
-          <div class="api-key-input">
-            <input id="apiKeyInput" type="password" placeholder="AIza..." autocomplete="off" />
-            <button type="button" class="btn-icon" onclick="toggleKeyVisibility('apiKeyInput','keyVisibilityIcon')"><span id="keyVisibilityIcon">Show</span></button>
-          </div>
-        </div>
-      </div>
-
-      <div id="vertexFields" class="hidden">
-        <div class="form-group">
-          <label for="vertexProjectInput">GCP project ID</label>
-          <input id="vertexProjectInput" type="text" placeholder="my-gcp-project" />
-        </div>
-        <div class="form-group">
-          <label for="vertexLocationInput">Location</label>
-          <input id="vertexLocationInput" type="text" value="global" placeholder="global" />
-        </div>
-        <div class="form-group">
-          <label for="vertexTokenInput">Access token</label>
-          <div class="api-key-input">
-            <input id="vertexTokenInput" type="password" placeholder="gcloud auth print-access-token" autocomplete="off" />
-            <button type="button" class="btn-icon" onclick="toggleKeyVisibility('vertexTokenInput','tokenVisibilityIcon')"><span id="tokenVisibilityIcon">Show</span></button>
-          </div>
-          <small>Run <code>gcloud auth print-access-token</code> and paste here</small>
-        </div>
-      </div>
-
+      <p id="authDetail" class="modal-desc"></p>
       <div class="modal-actions">
-        <button type="button" class="btn btn-secondary" onclick="hideApiKeyModal()">Cancel</button>
-        <button type="button" class="btn btn-danger" onclick="clearApiKey()">Clear</button>
-        <button type="button" class="btn btn-primary" onclick="saveApiKey()">Save</button>
+        <button type="button" class="btn btn-secondary" onclick="hideApiKeyModal()">Close</button>
+        <button type="button" class="btn btn-primary" onclick="refreshAuthStatus().then((ok)=>{ if(ok) hideApiKeyModal(); else showApiKeyModal(); })">Recheck</button>
       </div>
     </div>
   </div>

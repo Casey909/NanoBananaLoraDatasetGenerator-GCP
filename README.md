@@ -2,89 +2,49 @@
 
 Revamp of [lovisdotio/NanoBananaLoraDatasetGenerator](https://github.com/lovisdotio/NanoBananaLoraDatasetGenerator).
 
-FAL.ai is replaced with **Google Gemini / Vertex AI** so you can generate LoRA training packs from a few character reference images (face, body, etc.).
+Auth/generation uses the **same path as onestopvideo**:
+
+```text
+Browser UI  →  local python server.py  →  google.genai Client(vertexai=True)
+                                         →  Application Default Credentials
+```
+
+No Google API keys or pasted OAuth tokens in the browser.
+
+## Run (LAN, port 11904)
+
+```bash
+cd D:\Projects\NanoBananaLoraDatasetGenerator-GCP
+
+# Once per machine (same as onestopvideo):
+gcloud auth application-default login
+gcloud config set project llmapi-503100
+
+python server.py
+# binds 0.0.0.0:11904
+```
+
+Open:
+
+- Local: http://127.0.0.1:11904/
+- LAN: http://&lt;host-lan-ip&gt;:11904/
+
+`server.py` auto-loads `D:\Projects\onestopvideo\.env` for `OSV_PROJECT_ID` / `OSV_VERTEX_*`.
 
 ## Models
 
-### Image (Nano Banana)
-
-| UI label | Model ID |
-|----------|----------|
-| Nano Banana 2 | `gemini-3.1-flash-image` |
-| Nano Banana 2 Lite | `gemini-3.1-flash-lite-image` |
-| Nano Banana Pro | `gemini-3-pro-image` |
-
-### LLM / captions
-
-| UI label | Model ID |
-|----------|----------|
-| Gemini 3.6 Flash | `gemini-3.6-flash` |
-| Gemini 3.5 Flash | `gemini-3.5-flash` |
-| Gemini 3.5 Flash Lite | `gemini-3.5-flash-lite` |
-
-Flash models are used for prompt expansion and optional vision captions. Image generation uses the Nano Banana family only.
+| Role | Model IDs |
+|------|-----------|
+| Image | `gemini-3.1-flash-image` (Nano Banana 2), `gemini-3.1-flash-lite-image` (2 Lite), `gemini-3-pro-image` (Pro) |
+| LLM / captions | `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite` |
 
 ## Modes
 
-1. **Character LoRA** (default) — multi-slot refs (front face required) + curated pose/angle pack
-2. **Pair** — START → END edit pairs
-3. **Single** — style/aesthetic images
-4. **Reference** — variations from one image
-5. **Import + Edit** — batch-edit a local folder
+1. **Character LoRA** — multi-slot refs + curated shot pack
+2. Pair / Single / Reference / Import+Edit
 
-## Quick start
+## Offline check
 
 ```bash
-cd gcp-lora-character-dataset
-python -m http.server 8765
-# open http://localhost:8765
+node selfcheck.mjs
 ```
-
-Or:
-
-```bash
-npx --yes serve .
-```
-
-1. Click 🔑 and add a [Google AI Studio API key](https://aistudio.google.com/apikey)  
-   **or** Vertex AI project ID + `gcloud auth print-access-token`
-2. Upload face (+ optional body / side / outfit refs)
-3. Choose image + LLM models
-4. Start generation → Download ZIP
-
-## Output
-
-```
-gcp_lora_dataset_TIMESTAMP.zip
-├── 0001.png
-├── 0001.txt
-├── 0002.png
-├── 0002.txt
-└── ...
-```
-
-Pair / import-edit modes write `NNNN_start.png` + `NNNN_end.png` + `NNNN.txt`.
-
-## Files
-
-```
-gcp-lora-character-dataset/
-├── index.html      # UI
-├── app.js          # generation flows
-├── gemini.js       # Google AI + Vertex client
-├── character.js    # LoRA shot presets + ref slots
-├── style.css
-├── selfcheck.mjs   # offline sanity checks
-└── README.md
-```
-
-## Notes
-
-- Credentials stay in `localStorage` and are sent only to Google endpoints.
-- Nano Banana 2 Lite is 1K-only and weaker with many refs — prefer **Nano Banana 2** or **Pro** for character consistency.
-- Start with parallel = 1–2 to avoid rate limits.
-- Vertex tokens expire; refresh with `gcloud auth print-access-token`.
-
-## License
-
-MIT (same spirit as the upstream project).

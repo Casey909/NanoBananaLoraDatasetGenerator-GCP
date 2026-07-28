@@ -6,10 +6,9 @@
 import {
   IMAGE_MODELS,
   LLM_MODELS,
-  getSettings,
-  saveSettings,
-  clearSettings,
   hasCredentials,
+  refreshProxyHealth,
+  getProxyHealth,
   generateImage,
   generateText,
   parseJsonArray,
@@ -64,71 +63,34 @@ function truncate(str, length) {
 }
 
 // =============================================================================
-// Credentials UI
+// Auth status (Vertex ADC via local server.py — same as onestopvideo)
 // =============================================================================
 
 function showApiKeyModal() {
-  document.getElementById('apiKeyModal').classList.remove('hidden');
-  const s = getSettings();
-  document.getElementById('providerSelect').value = s.provider;
-  document.getElementById('apiKeyInput').value = s.apiKey;
-  document.getElementById('vertexProjectInput').value = s.project;
-  document.getElementById('vertexLocationInput').value = s.location || 'global';
-  document.getElementById('vertexTokenInput').value = s.token;
-  syncProviderFields();
-  document.getElementById('apiKeyInput').focus();
+  const modal = document.getElementById('apiKeyModal');
+  if (!modal) return;
+  const health = getProxyHealth();
+  const detail = document.getElementById('authDetail');
+  if (detail) {
+    detail.textContent = health?.ok
+      ? `Vertex ADC ready — project ${health.project || '?'} (${health.location || 'global'})`
+      : health?.detail || 'Server not ready. On the host run: python server.py';
+  }
+  modal.classList.remove('hidden');
 }
 
 function hideApiKeyModal() {
-  document.getElementById('apiKeyModal').classList.add('hidden');
+  document.getElementById('apiKeyModal')?.classList.add('hidden');
 }
 
-function syncProviderFields() {
-  const provider = document.getElementById('providerSelect').value;
-  document.getElementById('googleAiFields').classList.toggle('hidden', provider !== 'google-ai');
-  document.getElementById('vertexFields').classList.toggle('hidden', provider !== 'vertex');
-}
-
-function toggleKeyVisibility(inputId, iconId) {
-  const input = document.getElementById(inputId);
-  const icon = document.getElementById(iconId);
-  if (input.type === 'password') {
-    input.type = 'text';
-    icon.textContent = 'Hide';
-  } else {
-    input.type = 'password';
-    icon.textContent = 'Show';
+async function refreshAuthStatus() {
+  const health = await refreshProxyHealth();
+  if (health?.ok) {
+    updateStatus(true, `Vertex ADC (${health.project || 'ready'})`);
+    return true;
   }
-}
-
-function saveApiKey() {
-  const provider = document.getElementById('providerSelect').value;
-  const apiKey = document.getElementById('apiKeyInput').value.trim();
-  const project = document.getElementById('vertexProjectInput').value.trim();
-  const location = document.getElementById('vertexLocationInput').value.trim() || 'global';
-  const token = document.getElementById('vertexTokenInput').value.trim();
-
-  if (provider === 'google-ai' && !apiKey) {
-    alert('Enter a Google AI Studio API key');
-    return;
-  }
-  if (provider === 'vertex' && (!project || !token)) {
-    alert('Enter Vertex project ID and access token');
-    return;
-  }
-
-  saveSettings({ provider, apiKey, project, location, token });
-  hideApiKeyModal();
-  updateStatus(true, provider === 'vertex' ? 'Vertex ready' : 'API key saved');
-}
-
-function clearApiKey() {
-  if (!confirm('Clear stored credentials?')) return;
-  clearSettings();
-  document.getElementById('apiKeyInput').value = '';
-  document.getElementById('vertexProjectInput').value = '';
-  document.getElementById('vertexTokenInput').value = '';
-  updateStatus(false, 'No credentials');
+  updateStatus(false, 'Start python server.py (Vertex ADC)');
+  return false;
 }
 
 // =============================================================================
@@ -706,6 +668,7 @@ async function generateImportEditItem(importedImage, transformation, index, tota
 // =============================================================================
 
 async function startGeneration() {
+  await refreshAuthStatus();
   if (!hasCredentials()) {
     showApiKeyModal();
     return;
@@ -996,27 +959,25 @@ function populateModelSelects() {
     opt.textContent = `${m.label} (${m.id})`;
     llmSelect.appendChild(opt);
   });
-  llmSelect.value = 'gemini-3.5-flash';
+  llmSelect.value = 'gemini-3.6-flash';
 }
 
-function init() {
+async function init() {
   populateModelSelects();
   syncResolutionOptions();
   renderCharacterSlots();
 
-  if (hasCredentials()) {
-    const s = getSettings();
-    updateStatus(true, s.provider === 'vertex' ? 'Vertex ready' : 'API key set');
-  } else {
-    updateStatus(false, 'Click 🔑 to add credentials');
-    setTimeout(() => showApiKeyModal(), 400);
-  }
+  // Clear old browser API-key / pasted-token settings from earlier builds.
+  ['gcp_lora_provider', 'gcp_lora_api_key', 'gcp_lora_project', 'gcp_lora_location', 'gcp_lora_access_token', 'gcp_lora_use_proxy']
+    .forEach((k) => localStorage.removeItem(k));
+
+  const ready = await refreshAuthStatus();
+  if (!ready) setTimeout(() => showApiKeyModal(), 400);
 
   document.getElementById('numPairs').addEventListener('input', updateCostEstimate);
   document.getElementById('useVisionCaption').addEventListener('change', updateCostEstimate);
   document.getElementById('resolution').addEventListener('change', updateCostEstimate);
   document.getElementById('imageModel').addEventListener('change', syncResolutionOptions);
-  document.getElementById('providerSelect').addEventListener('change', syncProviderFields);
 
   updateCostEstimate();
   setMode('character');
@@ -1042,9 +1003,7 @@ function init() {
 
 window.showApiKeyModal = showApiKeyModal;
 window.hideApiKeyModal = hideApiKeyModal;
-window.toggleKeyVisibility = toggleKeyVisibility;
-window.saveApiKey = saveApiKey;
-window.clearApiKey = clearApiKey;
+window.refreshAuthStatus = refreshAuthStatus;
 window.startGeneration = startGeneration;
 window.stopGeneration = stopGeneration;
 window.downloadZIP = downloadZIP;
@@ -1056,6 +1015,5 @@ window.handleReferenceUpload = handleReferenceUpload;
 window.clearReference = clearReference;
 window.handleImportUpload = handleImportUpload;
 window.clearImportedImages = clearImportedImages;
-window.syncProviderFields = syncProviderFields;
 
 document.addEventListener('DOMContentLoaded', init);
