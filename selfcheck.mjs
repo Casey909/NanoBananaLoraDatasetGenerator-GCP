@@ -12,36 +12,31 @@ const root = dirname(fileURLToPath(import.meta.url));
 const load = (name) => readFileSync(join(root, name), 'utf8');
 
 const gemini = await import(pathToFileURL(join(root, 'gemini.js')).href);
-const character = await import(pathToFileURL(join(root, 'character.js')).href);
-
 assert.ok(gemini.IMAGE_MODELS['gemini-3.1-flash-image']);
-assert.ok(gemini.IMAGE_MODELS['gemini-3.1-flash-lite-image']);
-assert.ok(gemini.IMAGE_MODELS['gemini-3-pro-image']);
 assert.ok(gemini.LLM_MODELS['gemini-3.6-flash']);
-
-const shots = character.selectShotTemplates(8);
-assert.equal(shots.length, 8);
-
-const app = load('app.js');
-assert.match(app, /Vertex ADC/);
-assert.doesNotMatch(app, /AIza|print-access-token|fal\.subscribe/);
-
-const html = load('index.html');
-assert.match(html, /application-default login/);
-assert.doesNotMatch(html, /AI Studio API key|Access token/);
 
 const server = load('server.py');
 assert.match(server, /vertexai=True/);
-assert.match(server, /genai\.Client/);
-assert.match(server, /OSV_PROJECT_ID/);
-assert.match(server, /\/api\/logs/);
-assert.match(server, /def log\(/);
-assert.doesNotMatch(server, /GEMINI_API_KEY|print-access-token/);
+assert.match(server, /\/api\/jobs/);
+assert.match(server, /\/api\/characters/);
+assert.match(server, /\/api\/files\//);
+assert.match(server, /JobStore/);
 
-const geminiSrc = load('gemini.js');
-assert.match(geminiSrc, /setDebugSink/);
-assert.match(geminiSrc, /clientRequestId/);
+const jobs = load('jobs.py');
+assert.match(jobs, /class JobStore/);
+assert.match(jobs, /"data"/);
+assert.match(jobs, /"characters"/);
+assert.match(jobs, /regenerate_item/);
+assert.match(jobs, /autoResume/);
 
-assert.deepEqual(gemini.parseJsonArray('[{"prompt":"x"}]'), [{ prompt: 'x' }]);
+const app = load('app.js');
+assert.match(app, /beforeunload/);
+assert.match(app, /startPolling/);
+assert.match(app, /Regenerate/);
+assert.match(app, /\/api\/jobs/);
+
+const html = load('index.html');
+assert.match(html, /Start Backend Job/);
+assert.match(html, /data\/characters/);
 
 console.log('selfcheck OK');

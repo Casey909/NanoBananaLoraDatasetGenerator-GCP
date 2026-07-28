@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>GCP LoRA Character Dataset Generator</title>
+  <title>GCP LoRA Character Dataset</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
@@ -16,11 +16,11 @@
         <span class="logo-icon" aria-hidden="true">🍌</span>
         <div>
           <h1>GCP LoRA Character Dataset</h1>
-          <p class="logo-sub">Nano Banana 2 / Lite / Pro · Gemini Flash · Vertex ADC (onestopvideo path)</p>
+          <p class="logo-sub">Backend jobs · character folders · Vertex ADC (onestopvideo path)</p>
         </div>
       </div>
       <div class="header-actions">
-        <button class="btn-icon" type="button" onclick="showApiKeyModal()" title="Credentials">🔑</button>
+        <button class="btn-icon" type="button" onclick="showApiKeyModal()" title="Auth status">🔑</button>
         <div class="status-bar">
           <span id="statusDot" class="status-dot"></span>
           <span id="statusText">Checking...</span>
@@ -31,20 +31,21 @@
     <div class="main-content">
       <aside class="sidebar">
         <section class="panel">
-          <h2>Dataset</h2>
+          <h2>Dataset (on disk)</h2>
           <div class="dataset-count">
             <div class="count" id="pairCount">0</div>
-            <small id="countLabel">images in memory</small>
+            <small>images saved in character folder</small>
           </div>
+          <p id="characterSlugLabel" class="logo-sub" style="margin-top:8px">Folder: —</p>
+          <p id="activeJobLabel" class="logo-sub">No active job</p>
           <div class="auto-actions" style="margin-top:12px;flex-direction:column">
             <button class="btn btn-primary" type="button" onclick="downloadZIP()">Download ZIP</button>
-            <button class="btn btn-danger" type="button" onclick="clearResults()">Clear All</button>
+            <button class="btn btn-secondary" type="button" onclick="downloadDebugLogs()">Download Debug Logs</button>
           </div>
         </section>
 
         <section class="panel">
           <h2>Settings</h2>
-
           <div class="form-group">
             <label for="aspectRatio">Aspect Ratio</label>
             <select id="aspectRatio">
@@ -55,25 +56,20 @@
               <option value="3:4">3:4</option>
             </select>
           </div>
-
           <div class="form-group">
             <label for="resolution">Resolution</label>
             <select id="resolution"></select>
-            <small>Lite image model supports 1K only</small>
           </div>
-
           <div class="form-group">
             <label class="checkbox-label">
               <input type="checkbox" id="useVisionCaption" />
               Vision captions (Flash LLM)
             </label>
           </div>
-
           <div class="form-group">
             <label for="imageModel">Image model</label>
             <select id="imageModel"></select>
           </div>
-
           <div class="form-group">
             <label for="llmModel">LLM / caption model</label>
             <select id="llmModel"></select>
@@ -86,154 +82,75 @@
           <h2>Generate Dataset</h2>
           <div class="auto-intro">
             <p>
-              Upload a few character refs (face, body, etc.). Pick a Nano Banana image model and a Flash LLM.
-              Generates a diverse LoRA-ready image pack with captions, downloadable as ZIP.
+              Refs and outputs save under <code>data/characters/&lt;slug&gt;/</code> on the server.
+              Jobs keep running if you hide or leave this page (server process must stay up). Closing the tab asks for confirmation while a job is active.
             </p>
           </div>
 
           <div class="form-group">
-            <label>Generation Mode</label>
-            <div class="mode-selector">
-              <button type="button" class="mode-btn active" data-mode="character" onclick="setMode('character')">
-                <span class="mode-icon">👤</span>
-                <span class="mode-label">Character LoRA</span>
-                <span class="mode-desc">Multi-ref identity pack</span>
-              </button>
-              <button type="button" class="mode-btn" data-mode="pair" onclick="setMode('pair')">
-                <span class="mode-icon">🔄</span>
-                <span class="mode-label">Pair Mode</span>
-                <span class="mode-desc">START → END edits</span>
-              </button>
-              <button type="button" class="mode-btn" data-mode="single" onclick="setMode('single')">
-                <span class="mode-icon">🖼️</span>
-                <span class="mode-label">Single Image</span>
-                <span class="mode-desc">Style / aesthetic</span>
-              </button>
-              <button type="button" class="mode-btn" data-mode="reference" onclick="setMode('reference')">
-                <span class="mode-icon">📷</span>
-                <span class="mode-label">Reference</span>
-                <span class="mode-desc">One image variations</span>
-              </button>
-              <button type="button" class="mode-btn" data-mode="import-edit" onclick="setMode('import-edit')">
-                <span class="mode-icon">📂</span>
-                <span class="mode-label">Import + Edit</span>
-                <span class="mode-desc">Edit your folder</span>
-              </button>
-            </div>
-          </div>
-
-          <div id="characterRefsSection" class="form-group">
-            <label>Character reference images</label>
-            <div id="characterSlots" class="character-slots"></div>
-            <small>Front face is required. Extra refs improve identity lock (Nano Banana 2 / Pro handle multiple refs best).</small>
-          </div>
-
-          <div id="characterNameSection" class="form-group">
             <label for="characterName">Character name</label>
             <input id="characterName" type="text" placeholder="e.g. Aria Chen" />
-            <label class="checkbox-label" style="margin-top:8px">
-              <input type="checkbox" id="useCharacterPresets" checked />
-              Use curated LoRA shot presets (recommended)
-            </label>
+            <button type="button" class="btn btn-sm btn-secondary" style="margin-top:8px" onclick="ensureCharacter().then(()=>alert('Character folder ready')).catch(e=>alert(e.message))">Create / use folder</button>
           </div>
 
-          <div id="referenceUploadSection" class="form-group hidden">
-            <label>Reference Image</label>
-            <div class="reference-upload">
-              <div class="upload-zone" id="uploadZone" onclick="document.getElementById('referenceInput').click()">
-                <input id="referenceInput" type="file" accept="image/*" hidden onchange="handleReferenceUpload(event)" />
-                <div class="upload-placeholder" id="uploadPlaceholder">
-                  <span class="upload-icon">📤</span>
-                  <span>Click or drop reference</span>
-                </div>
-                <img id="referencePreview" class="reference-preview hidden" alt="reference" />
-              </div>
-              <button id="clearRefBtn" type="button" class="btn btn-sm btn-secondary" style="display:none" onclick="clearReference()">Clear</button>
-            </div>
+          <div class="form-group">
+            <label>Character reference images (uploaded to disk)</label>
+            <div id="characterSlots" class="character-slots"></div>
+            <small>Front face required. Files go to <code>refs/</code> in the character folder.</small>
           </div>
 
-          <div id="importEditSection" class="form-group hidden">
-            <label>Import Images</label>
-            <div class="import-upload">
-              <div class="upload-zone" onclick="document.getElementById('importInput').click()">
-                <input id="importInput" type="file" accept="image/*" multiple webkitdirectory directory hidden onchange="handleImportUpload(event)" />
-                <div class="upload-placeholder" id="importPlaceholder">
-                  <span class="upload-icon">📂</span>
-                  <span>Select a folder of images</span>
-                </div>
-              </div>
-              <div id="importPreviewList" class="import-preview-list hidden"></div>
-              <button id="clearImportBtn" type="button" class="btn btn-sm btn-secondary" style="display:none" onclick="clearImportedImages()">Clear All</button>
-            </div>
-            <div class="form-group" style="margin-top:12px">
-              <label for="importTransformation">Transformation to apply</label>
-              <textarea id="importTransformation" placeholder="e.g. Change clothing to a red leather jacket, keep identity"></textarea>
-            </div>
+          <div class="form-group">
+            <label for="modeSelect">Mode</label>
+            <select id="modeSelect">
+              <option value="character">Character LoRA</option>
+              <option value="single">Single / style</option>
+              <option value="pair">Pair (START→END)</option>
+            </select>
           </div>
 
           <div id="themeSection" class="form-group">
-            <label for="theme" id="themeLabel">Dataset theme / notes</label>
-            <textarea id="theme" placeholder="e.g. young East Asian woman, short black bob, warm skin tone; keep casual modern wardrobe"></textarea>
+            <label for="theme">Theme / notes</label>
+            <textarea id="theme" placeholder="wardrobe, age, style notes…"></textarea>
           </div>
 
           <div id="transformationSection" class="form-group hidden">
             <label for="transformation">Transformation to learn</label>
-            <input id="transformation" type="text" placeholder="e.g. zoom out, add background, change lighting" />
-          </div>
-
-          <div id="actionNameSection" class="form-group hidden">
-            <label for="actionName">Action name (optional)</label>
-            <input id="actionName" type="text" placeholder="e.g. unzoom" />
+            <input id="transformation" type="text" placeholder="e.g. change lighting / add background" />
           </div>
 
           <div class="form-group">
-            <label for="triggerWord">Trigger word (optional — prepended to .txt)</label>
+            <label for="triggerWord">Trigger word (optional)</label>
             <input id="triggerWord" type="text" placeholder="e.g. ohwx person" />
           </div>
 
           <div class="form-group">
-            <div class="collapsible-header" onclick="toggleSystemPrompt()">
-              <span>Custom system prompt</span>
-              <span id="systemPromptIcon">▶</span>
-            </div>
-            <div id="systemPromptSection" class="collapsible-content hidden">
-              <textarea id="customSystemPrompt" placeholder=""></textarea>
-              <button type="button" class="btn btn-sm btn-secondary" onclick="resetSystemPrompt()">Reset to default</button>
-            </div>
+            <label class="checkbox-label">
+              <input type="checkbox" id="useCharacterPresets" checked />
+              Use curated LoRA shot presets
+            </label>
           </div>
 
           <div class="form-group">
-            <label for="numPairs"><span id="pairOrImageLabel">Images</span> (max 40)</label>
+            <label for="numPairs">Number of images (max 40)</label>
             <input id="numPairs" type="number" min="1" max="40" value="20" />
-            <small id="costEstimate">Estimating...</small>
           </div>
 
           <div class="form-group">
-            <label for="maxConcurrent">Parallel requests</label>
-            <input id="maxConcurrent" type="number" min="1" max="10" value="1" />
-            <small>Use 1 to avoid 429 quota errors; increase only if stable</small>
+            <label for="maxConcurrent">Parallel (backend)</label>
+            <input id="maxConcurrent" type="number" min="1" max="3" value="1" />
+            <small>Keep at 1 to reduce 429 quota errors</small>
           </div>
 
           <div class="form-group">
             <label class="checkbox-label">
               <input type="checkbox" id="autoResumeFailed" checked />
-              Auto-resume failed requests
+              Auto-resume failed requests on backend
             </label>
-            <small>Retries 429 / quota / network failures with backoff until all succeed or you Stop</small>
-          </div>
-
-          <div class="form-group">
-            <label class="checkbox-label">
-              <input type="checkbox" id="verboseDebug" checked />
-              Verbose debug logs
-            </label>
-            <small>Shows request IDs, timings, ref sizes. Download JSON for full server+client logs.</small>
           </div>
 
           <div class="auto-actions">
-            <button class="btn btn-generate" type="button" onclick="startGeneration()">Start Generation</button>
-            <button class="btn btn-secondary" type="button" onclick="stopGeneration()">Stop</button>
-            <button class="btn btn-secondary" type="button" onclick="downloadDebugLogs()">Download Debug Logs</button>
+            <button class="btn btn-generate" type="button" onclick="startGeneration()">Start Backend Job</button>
+            <button class="btn btn-secondary" type="button" onclick="stopGeneration()">Stop Job</button>
             <button class="btn btn-secondary" type="button" onclick="refreshServerLogsIntoUi()">Show Server Logs</button>
           </div>
         </section>
@@ -247,11 +164,7 @@
         </section>
 
         <section class="panel results-panel">
-          <h2>Results</h2>
-          <div id="loadingIndicator" class="loading hidden">
-            <div class="spinner"></div>
-            <span>Working...</span>
-          </div>
+          <h2>Results (from character folder)</h2>
           <div id="results" class="results-grid"></div>
         </section>
       </main>
@@ -260,20 +173,20 @@
 
   <div id="apiKeyModal" class="modal hidden">
     <div class="modal-content">
-      <h2>Vertex ADC (same as onestopvideo)</h2>
+      <h2>Vertex ADC + backend jobs</h2>
       <p class="modal-desc">
-        This app does not use API keys in the browser. The host runs
-        <code>python server.py</code>, which calls Vertex with
-        <code>google.genai</code> + Application Default Credentials
-        (<code>gcloud auth application-default login</code>), same as OneStopVideo.
+        Auth uses <code>gcloud auth application-default login</code> on the host (same as onestopvideo).
+        Generation runs in <code>python server.py</code> background jobs and writes files under <code>data/characters/</code>.
       </p>
       <p id="authDetail" class="modal-desc"></p>
       <div class="modal-actions">
         <button type="button" class="btn btn-secondary" onclick="hideApiKeyModal()">Close</button>
-        <button type="button" class="btn btn-primary" onclick="refreshAuthStatus().then((ok)=>{ if(ok) hideApiKeyModal(); else showApiKeyModal(); })">Recheck</button>
+        <button type="button" class="btn btn-primary" onclick="refreshAuthStatus().then(()=>hideApiKeyModal())">Recheck</button>
       </div>
     </div>
   </div>
+
+  <div id="loadingIndicator" class="loading hidden" style="display:none"></div>
 
   <script type="module" src="app.js"></script>
 </body>

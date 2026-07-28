@@ -1,50 +1,49 @@
 # GCP LoRA Character Dataset Generator
 
-Revamp of [lovisdotio/NanoBananaLoraDatasetGenerator](https://github.com/lovisdotio/NanoBananaLoraDatasetGenerator).
-
-Auth/generation uses the **same path as onestopvideo**:
+Backend-first LoRA pack generator using the **same Vertex ADC path as onestopvideo**.
 
 ```text
-Browser UI  →  local python server.py  →  google.genai Client(vertexai=True)
-                                         →  Application Default Credentials
+Browser  →  python server.py (background jobs)
+         →  google.genai Client(vertexai=True) + ADC
+         →  data/characters/<slug>/{refs,dataset,jobs}/
 ```
 
-No Google API keys or pasted OAuth tokens in the browser.
+Hiding or closing the browser tab does **not** stop generation (server process must keep running). The UI polls job status/logs and reloads results from disk.
 
-## Run (LAN, port 11904)
+## Run
 
 ```bash
 cd D:\Projects\NanoBananaLoraDatasetGenerator-GCP
-
-# Once per machine (same as onestopvideo):
 gcloud auth application-default login
-gcloud config set project llmapi-503100
-
 python server.py
-# binds 0.0.0.0:11904
+# http://0.0.0.0:11904  (LAN OK)
 ```
 
-Open:
+Uses `D:\Projects\onestopvideo\.env` for `OSV_PROJECT_ID` / `OSV_VERTEX_*` when present.
 
-- Local: http://127.0.0.1:11904/
-- LAN: http://&lt;host-lan-ip&gt;:11904/
+## Character folders
 
-`server.py` auto-loads `D:\Projects\onestopvideo\.env` for `OSV_PROJECT_ID` / `OSV_VERTEX_*`.
+```
+data/characters/<slug>/
+  meta.json
+  refs/face_front.jpg
+  dataset/0001.png
+  dataset/0001.txt
+  dataset/0001.json
+  jobs/<jobId>.json
+```
+
+## Features
+
+- Backend jobs with auto-resume on 429
+- Live log/status polling (survives page hide)
+- Per-image refine textarea + Regenerate
+- beforeunload confirm while a job is active
+- ZIP download from saved folder files
 
 ## Models
 
-| Role | Model IDs |
-|------|-----------|
-| Image | `gemini-3.1-flash-image` (Nano Banana 2), `gemini-3.1-flash-lite-image` (2 Lite), `gemini-3-pro-image` (Pro) |
-| LLM / captions | `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite` |
-
-## Modes
-
-1. **Character LoRA** — multi-slot refs + curated shot pack
-2. Pair / Single / Reference / Import+Edit
-
-## Offline check
-
-```bash
-node selfcheck.mjs
-```
+| Role | IDs |
+|------|-----|
+| Image | `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`, `gemini-3-pro-image` |
+| LLM | `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite` |

@@ -1,690 +1,37 @@
 /**
- * GCP Nano Banana LoRA Character Dataset Generator
- * Revamp of lovisdotio/NanoBananaLoraDatasetGenerator — FAL replaced with Gemini/Vertex.
+ * Frontend job client — generation runs on backend character folders.
+ * Page can hide/sleep; poll resumes status/logs/results from disk-backed jobs.
  */
 
 import {
   IMAGE_MODELS,
   LLM_MODELS,
-  hasCredentials,
   refreshProxyHealth,
   getProxyHealth,
   fetchServerLogs,
   setDebugSink,
-  generateImage,
-  generateText,
-  parseJsonArray,
-  urlToBlob,
 } from './gemini.js';
 
-import {
-  REF_SLOTS,
-  buildCharacterPromptSeed,
-  selectShotTemplates,
-  shotsToPromptObjects,
-} from './character.js';
+import { REF_SLOTS } from './character.js';
 
 const state = {
-  isGenerating: false,
-  pairs: [],
-  pairCounter: 0,
-  mode: 'character', // character | pair | single | reference | import-edit
-  referenceImageBase64: null,
-  characterRefs: {}, // slotId -> dataUrl
-  importedImages: [],
-  clientLogs: [], // ring buffer for downloadable debug logs
+  characterSlug: localStorage.getItem('lora_character_slug') || '',
+  characterName: localStorage.getItem('lora_character_name') || '',
+  jobId: localStorage.getItem('lora_active_job') || '',
+  pollTimer: null,
+  lastLogCount: 0,
+  refs: {}, // slot -> url
+  job: null,
+  dirtyCloseGuard: false,
 };
 
-const DEFAULT_SYSTEM_PROMPTS = {
-  character: `You are a prompt engineer for character LoRA training datasets.
-Generate diverse, identity-preserving shot prompts for the same character.
-Vary pose, angle, expression, framing, lighting, and background while locking identity.`,
-  pair: `You are a creative prompt engineer for AI image generation. Generate diverse, detailed prompts for creating training data.
-RULES:
-1. Each prompt must be unique and creative
-2. base_prompt: Detailed description for generating the START image
-3. edit_prompt: Instruction for transforming START → END image
-4. action_name: Short identifier for this transformation type`,
-  single: `You are a creative prompt engineer for AI image generation. Generate diverse, detailed prompts for style/aesthetic training data.
-RULES:
-1. Each prompt must be unique and creative
-2. prompt: Detailed description capturing aesthetic, style, composition, lighting, and mood`,
-  reference: `You are a creative prompt engineer for AI image generation. Generate diverse prompts for variations of a reference image.
-RULES:
-1. Keep the subject recognizable
-2. Vary poses, angles, backgrounds, lighting, and contexts`,
-  'import-edit': `You describe image transformations clearly and specifically for an image-editing model.`,
-};
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+function $(id) {
+  return document.getElementById(id);
 }
 
-function truncate(str, length) {
+function truncate(str, n) {
   if (!str) return '';
-  return str.length > length ? `${str.substring(0, length)}...` : str;
-}
-
-function isRetryableError(err) {
-  const msg = String(err?.message || err || '');
-  const status = err?.status;
-  // Do not endlessly retry INVALID_ARGUMENT — payload must be fixed.
-  if (/INVALID_ARGUMENT|invalid argument/i.test(msg) || status === 400) return false;
-  return (
-    status === 429 ||
-    status === 408 ||
-    (status && status >= 500) ||
-    /429|RESOURCE_EXHAUSTED|UNAVAILABLE|timeout|fetch|network|503|502|500/i.test(msg)
-  );
-}
-
-function autoResumeEnabled() {
-  return document.getElementById('autoResumeFailed')?.checked !== false;
-}
-
-/**
- * Run jobs in batches; retryable failures are re-queued until success or Stop.
- * jobs: [{ key, run: () => Promise<result>, onSuccess?(value) }]
- */
-async function runJobsWithAutoResume(jobs, { maxConcurrent, label = 'items' }) {
-  let pending = jobs.map((job, index) => ({ ...job, index, attempts: 0 }));
-  let completed = 0;
-  let permanentFailed = 0;
-  let round = 0;
-  const total = jobs.length;
-
-  updateProgress(0, total, `0/${total} ${label}`);
-
-  while (pending.length && state.isGenerating) {
-    round += 1;
-    // After first wave, slow down to ease quota pressure.
-    const concurrent = round === 1 ? maxConcurrent : Math.max(1, Math.min(2, maxConcurrent));
-    const wave = pending;
-    pending = [];
-    const retryQueue = [];
-
-    for (let i = 0; i < wave.length; i += concurrent) {
-      if (!state.isGenerating) {
-        pending.push(...wave.slice(i), ...retryQueue);
-        retryQueue.length = 0;
-        break;
-      }
-
-      const batch = wave.slice(i, i + concurrent);
-      const results = await Promise.allSettled(batch.map((job) => job.run()));
-
-      for (let j = 0; j < results.length; j++) {
-        const job = batch[j];
-        const result = results[j];
-        job.attempts += 1;
-
-        if (result.status === 'fulfilled') {
-          completed += 1;
-          job.onSuccess?.(result.value, job);
-          updateProgress(completed, total, `${completed}/${total} done`);
-          continue;
-        }
-
-        const errMsg = result.reason?.message || 'error';
-        addProgressLog(
-          `${job.key} failed (try ${job.attempts}): ${truncate(errMsg, 140)}`,
-          'error'
-        );
-
-        if (isRetryableError(result.reason) && autoResumeEnabled()) {
-          retryQueue.push(job);
-        } else if (isRetryableError(result.reason) && !autoResumeEnabled()) {
-          permanentFailed += 1;
-          addProgressLog(`${job.key} left failed (auto-resume off)`, 'error');
-        } else {
-          permanentFailed += 1;
-          addProgressLog(`${job.key} skipped (not retryable)`, 'error');
-        }
-      }
-
-      updateProgress(completed, total, `${completed}/${total} done · ${retryQueue.length} to resume`);
-    }
-
-    if (!state.isGenerating) break;
-    if (!retryQueue.length) break;
-
-    const delaySec = Math.min(120, 10 * 2 ** Math.min(round - 1, 4));
-    addProgressLog(
-      `Auto-resume: ${retryQueue.length} failed — retry in ${delaySec}s (round ${round + 1}, parallel ${concurrent})…`,
-      'info'
-    );
-
-    for (let t = delaySec; t > 0 && state.isGenerating; t -= 1) {
-      updateProgress(completed, total, `Resume in ${t}s (${retryQueue.length} left)`);
-      await sleep(1000);
-    }
-
-    if (!state.isGenerating) {
-      pending = retryQueue;
-      break;
-    }
-
-    pending = retryQueue;
-  }
-
-  const leftover = pending.length + permanentFailed;
-  return {
-    completed,
-    failed: leftover,
-    stopped: !state.isGenerating && pending.length > 0,
-  };
-}
-
-// =============================================================================
-// Auth status (Vertex ADC via local server.py — same as onestopvideo)
-// =============================================================================
-
-function showApiKeyModal() {
-  const modal = document.getElementById('apiKeyModal');
-  if (!modal) return;
-  const health = getProxyHealth();
-  const detail = document.getElementById('authDetail');
-  if (detail) {
-    detail.textContent = health?.ok
-      ? `Vertex ADC ready — project ${health.project || '?'} (${health.location || 'global'})`
-      : health?.detail || 'Server not ready. On the host run: python server.py';
-  }
-  modal.classList.remove('hidden');
-}
-
-function hideApiKeyModal() {
-  document.getElementById('apiKeyModal')?.classList.add('hidden');
-}
-
-async function refreshAuthStatus() {
-  const health = await refreshProxyHealth();
-  if (health?.ok) {
-    updateStatus(true, `Vertex ADC (${health.project || 'ready'})`);
-    return true;
-  }
-  updateStatus(false, 'Start python server.py (Vertex ADC)');
-  return false;
-}
-
-// =============================================================================
-// Mode / UI
-// =============================================================================
-
-function setMode(mode) {
-  state.mode = mode;
-  document.querySelectorAll('.mode-btn').forEach((btn) => {
-    btn.classList.toggle('active', btn.dataset.mode === mode);
-  });
-
-  const sections = {
-    transformationSection: false,
-    actionNameSection: false,
-    referenceUploadSection: false,
-    characterRefsSection: false,
-    importEditSection: false,
-    themeSection: true,
-    characterNameSection: false,
-  };
-
-  const numPairsGroup = document.getElementById('numPairs')?.closest('.form-group');
-  if (numPairsGroup) numPairsGroup.classList.remove('hidden');
-
-  if (mode === 'character') {
-    sections.characterRefsSection = true;
-    sections.characterNameSection = true;
-    document.getElementById('pairOrImageLabel').textContent = 'Images';
-    document.getElementById('countLabel').textContent = 'images in memory';
-    document.getElementById('progressLabel').textContent = 'images';
-  } else if (mode === 'pair') {
-    sections.transformationSection = true;
-    sections.actionNameSection = true;
-    document.getElementById('pairOrImageLabel').textContent = 'Pairs';
-    document.getElementById('countLabel').textContent = 'pairs in memory';
-    document.getElementById('progressLabel').textContent = 'pairs';
-  } else if (mode === 'single') {
-    document.getElementById('pairOrImageLabel').textContent = 'Images';
-    document.getElementById('countLabel').textContent = 'images in memory';
-    document.getElementById('progressLabel').textContent = 'images';
-  } else if (mode === 'reference') {
-    sections.referenceUploadSection = true;
-    document.getElementById('pairOrImageLabel').textContent = 'Images';
-    document.getElementById('countLabel').textContent = 'images in memory';
-    document.getElementById('progressLabel').textContent = 'images';
-  } else if (mode === 'import-edit') {
-    sections.importEditSection = true;
-    sections.themeSection = false;
-    if (numPairsGroup) numPairsGroup.classList.add('hidden');
-    document.getElementById('pairOrImageLabel').textContent = 'Images';
-    document.getElementById('countLabel').textContent = 'edited pairs in memory';
-    document.getElementById('progressLabel').textContent = 'images';
-  }
-
-  Object.entries(sections).forEach(([id, show]) => {
-    const el = document.getElementById(id);
-    if (el) el.classList.toggle('hidden', !show);
-  });
-
-  updateCostEstimate();
-  updateSystemPromptPlaceholder();
-}
-
-function updateSystemPromptPlaceholder() {
-  const textarea = document.getElementById('customSystemPrompt');
-  textarea.placeholder = DEFAULT_SYSTEM_PROMPTS[state.mode] || '';
-}
-
-function toggleSystemPrompt() {
-  const section = document.getElementById('systemPromptSection');
-  const icon = document.getElementById('systemPromptIcon');
-  const isHidden = section.classList.contains('hidden');
-  section.classList.toggle('hidden');
-  icon.textContent = isHidden ? '▼' : '▶';
-}
-
-function resetSystemPrompt() {
-  document.getElementById('customSystemPrompt').value = '';
-}
-
-function getSystemPrompt() {
-  const custom = document.getElementById('customSystemPrompt').value.trim();
-  return custom || DEFAULT_SYSTEM_PROMPTS[state.mode];
-}
-
-function getImageModelId() {
-  return document.getElementById('imageModel')?.value || 'gemini-3.1-flash-image';
-}
-
-function getLlmModelId() {
-  return document.getElementById('llmModel')?.value || 'gemini-3.5-flash';
-}
-
-function syncResolutionOptions() {
-  const model = IMAGE_MODELS[getImageModelId()];
-  const select = document.getElementById('resolution');
-  const current = select.value;
-  select.innerHTML = '';
-  for (const size of model.sizes) {
-    const opt = document.createElement('option');
-    opt.value = size;
-    opt.textContent = size;
-    select.appendChild(opt);
-  }
-  select.value = model.sizes.includes(current) ? current : model.sizes[0];
-  updateCostEstimate();
-}
-
-// =============================================================================
-// Uploads
-// =============================================================================
-
-async function fileToCompressedDataUrl(file, maxSide = 1536) {
-  addDebugLog('DEBUG', 'upload.read_start', { name: file?.name, type: file?.type, size: file?.size });
-  const rawUrl = await new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-
-  try {
-    const img = await new Promise((resolve, reject) => {
-      const el = new Image();
-      el.onload = () => resolve(el);
-      el.onerror = reject;
-      el.src = rawUrl;
-    });
-    const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
-    const w = Math.max(1, Math.round(img.width * scale));
-    const h = Math.max(1, Math.round(img.height * scale));
-    const canvas = document.createElement('canvas');
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(img, 0, 0, w, h);
-    const out = canvas.toDataURL('image/jpeg', 0.88);
-    addDebugLog('INFO', 'upload.compressed', {
-      name: file?.name,
-      from: `${img.width}x${img.height}`,
-      to: `${w}x${h}`,
-      inChars: String(rawUrl).length,
-      outChars: out.length,
-    });
-    return out;
-  } catch (e) {
-    addDebugLog('WARN', 'upload.compress_failed_use_raw', { name: file?.name, error: String(e?.message || e) });
-    return rawUrl;
-  }
-}
-
-async function handleReferenceUpload(event) {
-  const file = event.target.files[0];
-  if (!file) return;
-  try {
-    const dataUrl = await fileToCompressedDataUrl(file);
-    state.referenceImageBase64 = dataUrl;
-    const preview = document.getElementById('referencePreview');
-    const placeholder = document.getElementById('uploadPlaceholder');
-    preview.src = dataUrl;
-    preview.classList.remove('hidden');
-    placeholder.classList.add('hidden');
-    document.getElementById('clearRefBtn').style.display = 'block';
-  } catch (e) {
-    alert(`Failed to read image: ${e.message || e}`);
-  }
-}
-
-function clearReference() {
-  state.referenceImageBase64 = null;
-  const preview = document.getElementById('referencePreview');
-  preview.classList.add('hidden');
-  preview.src = '';
-  document.getElementById('uploadPlaceholder').classList.remove('hidden');
-  document.getElementById('clearRefBtn').style.display = 'none';
-  document.getElementById('referenceInput').value = '';
-}
-
-async function handleCharacterRefUpload(slotId, event) {
-  const file = event.target.files?.[0];
-  if (!file) return;
-  try {
-    const dataUrl = await fileToCompressedDataUrl(file);
-    state.characterRefs[slotId] = dataUrl;
-    const preview = document.getElementById(`char-preview-${slotId}`);
-    const placeholder = document.getElementById(`char-ph-${slotId}`);
-    if (preview) {
-      preview.src = dataUrl;
-      preview.classList.remove('hidden');
-    }
-    if (placeholder) placeholder.classList.add('hidden');
-  } catch (e) {
-    alert(`Failed to read ${slotId}: ${e.message || e}`);
-  }
-}
-
-function clearCharacterRef(slotId) {
-  delete state.characterRefs[slotId];
-  const preview = document.getElementById(`char-preview-${slotId}`);
-  const placeholder = document.getElementById(`char-ph-${slotId}`);
-  const input = document.getElementById(`char-input-${slotId}`);
-  if (preview) {
-    preview.classList.add('hidden');
-    preview.src = '';
-  }
-  if (placeholder) placeholder.classList.remove('hidden');
-  if (input) input.value = '';
-}
-
-function getCharacterRefList() {
-  // Prefer required/front slots first for model attention order.
-  const order = REF_SLOTS.map((s) => s.id);
-  return order.map((id) => state.characterRefs[id]).filter(Boolean);
-}
-
-function renderCharacterSlots() {
-  const grid = document.getElementById('characterSlots');
-  if (!grid) return;
-  grid.innerHTML = '';
-  for (const slot of REF_SLOTS) {
-    const wrap = document.createElement('div');
-    wrap.className = 'char-slot';
-    wrap.innerHTML = `
-      <label class="char-slot-label">${slot.label}${slot.required ? ' *' : ''}</label>
-      <div class="upload-zone char-zone" id="char-zone-${slot.id}">
-        <input type="file" accept="image/*" id="char-input-${slot.id}" hidden />
-        <div class="upload-placeholder" id="char-ph-${slot.id}">
-          <span class="upload-icon">＋</span>
-          <span>Upload</span>
-        </div>
-        <img id="char-preview-${slot.id}" class="reference-preview hidden" alt="${slot.label}" />
-      </div>
-      <button type="button" class="btn btn-sm btn-secondary" data-clear="${slot.id}">Clear</button>
-    `;
-    grid.appendChild(wrap);
-
-    const zone = wrap.querySelector(`#char-zone-${slot.id}`);
-    const input = wrap.querySelector(`#char-input-${slot.id}`);
-    zone.addEventListener('click', () => input.click());
-    input.addEventListener('change', (e) => handleCharacterRefUpload(slot.id, e));
-    wrap.querySelector(`[data-clear="${slot.id}"]`).addEventListener('click', (e) => {
-      e.stopPropagation();
-      clearCharacterRef(slot.id);
-    });
-    zone.addEventListener('dragover', (e) => {
-      e.preventDefault();
-      zone.classList.add('dragover');
-    });
-    zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
-    zone.addEventListener('drop', (e) => {
-      e.preventDefault();
-      zone.classList.remove('dragover');
-      const file = e.dataTransfer.files[0];
-      if (file?.type.startsWith('image/')) {
-        handleCharacterRefUpload(slot.id, { target: { files: [file] } });
-      }
-    });
-  }
-}
-
-async function handleImportUpload(event) {
-  const files = Array.from(event.target.files || []).filter((f) => f.type.startsWith('image/'));
-  if (!files.length) {
-    alert('No images found');
-    return;
-  }
-
-  state.importedImages = [];
-  const previewList = document.getElementById('importPreviewList');
-  previewList.innerHTML = '';
-  previewList.classList.remove('hidden');
-  document.getElementById('clearImportBtn').style.display = 'block';
-  document.getElementById('importPlaceholder').innerHTML = `<span>Loading ${files.length} images...</span>`;
-
-  await Promise.all(
-    files.map(
-      (file) =>
-        new Promise((resolve) => {
-          const reader = new FileReader();
-          reader.onload = (e) => {
-            state.importedImages.push({ file, base64: e.target.result, name: file.name });
-            const thumb = document.createElement('div');
-            thumb.className = 'import-thumb';
-            thumb.innerHTML = `<img src="${e.target.result}" alt="${file.name}" /><span>${file.name}</span>`;
-            previewList.appendChild(thumb);
-            resolve();
-          };
-          reader.onerror = () => resolve();
-          reader.readAsDataURL(file);
-        })
-    )
-  );
-
-  document.getElementById('importPlaceholder').innerHTML = `<span>${state.importedImages.length} images loaded</span>`;
-  updateCostEstimate();
-}
-
-function clearImportedImages() {
-  state.importedImages = [];
-  document.getElementById('importPreviewList').innerHTML = '';
-  document.getElementById('importPreviewList').classList.add('hidden');
-  document.getElementById('clearImportBtn').style.display = 'none';
-  document.getElementById('importInput').value = '';
-  document.getElementById('importPlaceholder').innerHTML = `<span class="upload-icon">📂</span><span>Select a folder of images</span>`;
-  updateCostEstimate();
-}
-
-// =============================================================================
-// Status / progress / results
-// =============================================================================
-
-function updateStatus(connected, message) {
-  document.getElementById('statusDot').className = `status-dot ${connected ? 'connected' : 'error'}`;
-  document.getElementById('statusText').textContent = message;
-}
-
-function updatePairCount() {
-  document.getElementById('pairCount').textContent = state.pairs.length;
-}
-
-function updateCostEstimate() {
-  const useVision = document.getElementById('useVisionCaption').checked;
-  const el = document.getElementById('costEstimate');
-  if (state.mode === 'import-edit') {
-    const n = state.importedImages.length;
-    el.textContent = n ? `~${n} image edit call(s)${useVision ? ' + captions' : ''}` : 'Import images first';
-    return;
-  }
-  const num = parseInt(document.getElementById('numPairs').value, 10) || 20;
-  const imagesPerItem = state.mode === 'pair' ? 2 : 1;
-  el.textContent = `~${num * imagesPerItem} image call(s)${useVision ? ' + captions' : ''} + 1 LLM prompt call`;
-}
-
-function showLoading(show, message = 'Working...') {
-  const loader = document.getElementById('loadingIndicator');
-  loader.classList.toggle('hidden', !show);
-  loader.querySelector('span').textContent = message;
-}
-
-function showProgress(show) {
-  document.getElementById('progressPanel').classList.toggle('hidden', !show);
-}
-
-function updateProgress(current, total, status) {
-  const percent = total > 0 ? (current / total) * 100 : 0;
-  document.getElementById('progressFill').style.width = `${percent}%`;
-  document.getElementById('progressCurrent').textContent = current;
-  document.getElementById('progressTotal').textContent = total;
-  document.getElementById('progressStatus').textContent = status;
-}
-
-function verboseDebugEnabled() {
-  return document.getElementById('verboseDebug')?.checked !== false;
-}
-
-function pushClientLog(level, message, meta = {}) {
-  const entry = {
-    ts: new Date().toISOString(),
-    level,
-    message,
-    ...meta,
-  };
-  state.clientLogs.push(entry);
-  if (state.clientLogs.length > 2000) state.clientLogs.splice(0, state.clientLogs.length - 2000);
-  return entry;
-}
-
-function addProgressLog(message, type = 'info') {
-  const level = type === 'error' ? 'ERROR' : type === 'success' ? 'INFO' : type === 'warn' ? 'WARN' : 'INFO';
-  pushClientLog(level, message, { ui: true });
-  const log = document.getElementById('progressLog');
-  if (!log) return;
-  const entry = document.createElement('div');
-  entry.className = `log-entry log-${type}`;
-  const ts = new Date().toLocaleTimeString();
-  entry.textContent = `[${ts}] ${message}`;
-  log.appendChild(entry);
-  // Keep DOM from exploding on long auto-resume runs.
-  while (log.children.length > 400) log.removeChild(log.firstChild);
-  log.scrollTop = log.scrollHeight;
-}
-
-function addDebugLog(level, message, meta = {}) {
-  pushClientLog(level, message, meta);
-  if (!verboseDebugEnabled() && level === 'DEBUG') return;
-  const type = level === 'ERROR' ? 'error' : level === 'WARN' ? 'warn' : 'info';
-  const extra = meta && Object.keys(meta).length
-    ? ` | ${truncate(JSON.stringify(meta), 180)}`
-    : '';
-  addProgressLog(`[dbg] ${message}${extra}`, type);
-}
-
-function clearProgressLog() {
-  const log = document.getElementById('progressLog');
-  if (log) log.innerHTML = '';
-}
-
-async function downloadDebugLogs() {
-  showProgress(true);
-  addProgressLog('Collecting client + server logs…', 'info');
-  let serverLogs = [];
-  let serverMeta = {};
-  try {
-    const payload = await fetchServerLogs(300);
-    serverLogs = payload.logs || [];
-    serverMeta = { logFile: payload.logFile, count: payload.count };
-  } catch (e) {
-    addProgressLog(`Server logs unavailable: ${e.message}`, 'error');
-  }
-
-  const blob = new Blob(
-    [
-      JSON.stringify(
-        {
-          exportedAt: new Date().toISOString(),
-          health: getProxyHealth(),
-          serverMeta,
-          clientLogs: state.clientLogs,
-          serverLogs,
-          ui: {
-            mode: state.mode,
-            imageModel: getImageModelId(),
-            llmModel: getLlmModelId(),
-            pairsInMemory: state.pairs.length,
-            characterRefSlots: Object.keys(state.characterRefs),
-          },
-        },
-        null,
-        2
-      ),
-    ],
-    { type: 'application/json' }
-  );
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `lora_debug_logs_${Date.now()}.json`;
-  a.click();
-  URL.revokeObjectURL(url);
-  addProgressLog('Debug logs downloaded', 'success');
-}
-
-async function refreshServerLogsIntoUi() {
-  try {
-    const payload = await fetchServerLogs(40);
-    addProgressLog(`Server log file: ${payload.logFile || 'n/a'} (${payload.count || 0} in memory)`, 'info');
-    for (const row of (payload.logs || []).slice(-20)) {
-      const type = row.level === 'ERROR' ? 'error' : row.level === 'WARN' ? 'warn' : 'info';
-      addProgressLog(`[srv ${row.event}] ${truncate(JSON.stringify(row), 200)}`, type);
-    }
-  } catch (e) {
-    addProgressLog(`Could not fetch /api/logs: ${e.message}`, 'error');
-  }
-}
-
-function addResultCard(item) {
-  const container = document.getElementById('results');
-  const card = document.createElement('div');
-  card.className = 'result-card';
-
-  if (item.mode === 'pair' || (item.startUrl && item.endUrl)) {
-    card.innerHTML = `
-      <div class="result-header"><span class="result-id">#${item.id}</span></div>
-      <div class="result-images">
-        <div class="result-image"><span class="label">START</span><img src="${item.startUrl}" alt="start" /></div>
-        <div class="result-image"><span class="label">END</span><img src="${item.endUrl}" alt="end" /></div>
-      </div>
-      <div class="result-caption">${escapeHtml(truncate(item.text, 160))}</div>
-    `;
-  } else {
-    card.innerHTML = `
-      <div class="result-header"><span class="result-id">#${item.id}</span>${item.tag ? `<span class="result-tag">${escapeHtml(item.tag)}</span>` : ''}</div>
-      <div class="result-images single">
-        <div class="result-image"><img src="${item.imageUrl}" alt="result" /></div>
-      </div>
-      <div class="result-caption">${escapeHtml(truncate(item.text, 160))}</div>
-    `;
-  }
-
-  container.insertBefore(card, container.firstChild);
+  return str.length > n ? `${str.slice(0, n)}...` : str;
 }
 
 function escapeHtml(str) {
@@ -695,490 +42,83 @@ function escapeHtml(str) {
     .replaceAll('"', '&quot;');
 }
 
-// =============================================================================
-// Generation helpers
-// =============================================================================
-
-async function captionImage(imageDataUrlOrObjectUrl, modelId) {
-  // Prefer fetching blob and converting if object URL; for captions pass as data URL when possible.
-  let dataUrl = imageDataUrlOrObjectUrl;
-  if (imageDataUrlOrObjectUrl.startsWith('blob:')) {
-    const blob = await urlToBlob(imageDataUrlOrObjectUrl);
-    dataUrl = await blobToDataUrl(blob);
-  }
-  return generateText({
-    modelId,
-    systemPrompt: 'Only answer the question. No markdown.',
-    userText:
-      'Caption this image for a text-to-image LoRA. Describe subject appearance, clothing, pose, expression, background, lighting, colors, and style in one dense paragraph.',
-    imageDataUrls: [dataUrl],
-    temperature: 0.4,
-  });
+function updateStatus(ok, message) {
+  $('statusDot').className = `status-dot ${ok ? 'connected' : 'error'}`;
+  $('statusText').textContent = message;
 }
 
-async function captionEditPair(startUrl, endUrl, modelId) {
-  const startData = startUrl.startsWith('blob:') ? await blobToDataUrl(await urlToBlob(startUrl)) : startUrl;
-  const endData = endUrl.startsWith('blob:') ? await blobToDataUrl(await urlToBlob(endUrl)) : endUrl;
-  return generateText({
-    modelId,
-    systemPrompt: 'Only describe the transformation in one sentence. No markdown.',
-    userText:
-      'Image 1 is BEFORE, image 2 is AFTER. Describe the edit/transformation applied.',
-    imageDataUrls: [startData, endData],
-    temperature: 0.3,
-  });
+function addProgressLog(message, type = 'info') {
+  const log = $('progressLog');
+  if (!log) return;
+  const entry = document.createElement('div');
+  entry.className = `log-entry log-${type}`;
+  entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+  log.appendChild(entry);
+  while (log.children.length > 500) log.removeChild(log.firstChild);
+  log.scrollTop = log.scrollHeight;
 }
 
-function blobToDataUrl(blob) {
+function showProgress(show) {
+  $('progressPanel')?.classList.toggle('hidden', !show);
+}
+
+function updateProgress(current, total, status) {
+  const percent = total > 0 ? (current / total) * 100 : 0;
+  $('progressFill').style.width = `${percent}%`;
+  $('progressCurrent').textContent = current;
+  $('progressTotal').textContent = total;
+  $('progressStatus').textContent = status;
+}
+
+function setCloseGuard(on) {
+  state.dirtyCloseGuard = !!on;
+}
+
+function jobIsActive(job) {
+  return job && ['queued', 'running', 'stopping', 'regenerating'].includes(job.status);
+}
+
+async function api(path, options = {}) {
+  const res = await fetch(path, {
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    ...options,
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json?.error?.message || `HTTP ${res.status}`);
+  return json;
+}
+
+function fileToCompressedDataUrl(file, maxSide = 1536) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
     reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-}
-
-async function generatePromptsWithLLM(theme, transformation, actionName, numPrompts, modelId) {
-  const customSystemPrompt = getSystemPrompt();
-
-  if (state.mode === 'pair') {
-    const actionHint = actionName
-      ? `Use this action name: "${actionName}"`
-      : 'Generate a short descriptive action name';
-    const userPrompt = `Generate ${numPrompts} unique prompt pairs for theme: "${theme}"
-Transformation: "${transformation}"
-${actionHint}
-
-Return ONLY a valid JSON array:
-[{"base_prompt":"...","edit_prompt":"...","action_name":"..."}]`;
-
-    const text = await generateText({
-      modelId,
-      systemPrompt: `${customSystemPrompt}\n\n${actionHint}`,
-      userText: userPrompt,
-    });
-    return parseJsonArray(text);
-  }
-
-  if (state.mode === 'single') {
-    const userPrompt = `Generate ${numPrompts} unique image prompts for theme/style: "${theme}"
-Return ONLY a valid JSON array:
-[{"prompt":"..."}]`;
-    const text = await generateText({
-      modelId,
-      systemPrompt: customSystemPrompt,
-      userText: userPrompt,
-    });
-    return parseJsonArray(text);
-  }
-
-  if (state.mode === 'reference') {
-    const userPrompt = `Generate ${numPrompts} unique variation prompts for: "${theme}"
-Each prompt should describe a different scenario/pose/angle/background while keeping the subject consistent.
-Return ONLY a valid JSON array:
-[{"prompt":"..."}]`;
-    const text = await generateText({
-      modelId,
-      systemPrompt: customSystemPrompt,
-      userText: userPrompt,
-    });
-    return parseJsonArray(text);
-  }
-
-  if (state.mode === 'character') {
-    const usePreset = document.getElementById('useCharacterPresets')?.checked !== false;
-    const characterName = document.getElementById('characterName')?.value?.trim() || 'character';
-    const triggerWord = document.getElementById('triggerWord')?.value?.trim() || '';
-
-    if (usePreset) {
-      const shots = selectShotTemplates(numPrompts);
-      return shotsToPromptObjects(shots, characterName, theme);
-    }
-
-    const seed = buildCharacterPromptSeed(characterName, triggerWord, theme);
-    const userPrompt = `Generate ${numPrompts} unique LoRA training shot prompts for character "${characterName}".
-Theme/notes: "${theme}"
-${seed.identityLock}
-
-Cover face angles, expressions, upper body, full body, lighting, and contexts.
-Return ONLY a valid JSON array:
-[{"prompt":"...","tag":"short_tag"}]`;
-
-    const text = await generateText({
-      modelId,
-      systemPrompt: customSystemPrompt,
-      userText: userPrompt,
-    });
-    return parseJsonArray(text);
-  }
-
-  throw new Error(`Unsupported mode for LLM prompts: ${state.mode}`);
-}
-
-async function generatePairItem(prompt, index, total, aspectRatio, resolution, useVision, llmModel, triggerWord) {
-  addProgressLog(`[${index + 1}/${total}] START: ${truncate(prompt.base_prompt, 40)}`, 'info');
-  const start = await generateImage({
-    modelId: getImageModelId(),
-    prompt: prompt.base_prompt,
-    aspectRatio,
-    imageSize: resolution,
-  });
-  addProgressLog(`[${index + 1}] END edit...`, 'info');
-  const end = await generateImage({
-    modelId: getImageModelId(),
-    prompt: prompt.edit_prompt,
-    referenceDataUrls: [await blobToDataUrl(await urlToBlob(start.objectUrl))],
-    aspectRatio,
-    imageSize: resolution,
-  });
-
-  let finalText = prompt.action_name || prompt.edit_prompt;
-  if (useVision) {
-    try {
-      finalText = await captionEditPair(start.objectUrl, end.objectUrl, llmModel);
-    } catch (e) {
-      console.warn('Vision caption failed', e);
-    }
-  }
-  if (triggerWord) finalText = `${triggerWord} ${finalText}`;
-
-  return {
-    startUrl: start.objectUrl,
-    endUrl: end.objectUrl,
-    startPrompt: prompt.base_prompt,
-    endPrompt: prompt.edit_prompt,
-    actionName: prompt.action_name,
-    text: finalText,
-  };
-}
-
-async function generateSingleItem(prompt, index, total, aspectRatio, resolution, useVision, llmModel, triggerWord, refs = []) {
-  addProgressLog(`[${index + 1}/${total}] ${truncate(prompt.prompt, 48)}`, 'info');
-  const image = await generateImage({
-    modelId: getImageModelId(),
-    prompt: prompt.prompt,
-    referenceDataUrls: refs,
-    aspectRatio,
-    imageSize: resolution,
-  });
-
-  let finalText = prompt.prompt;
-  if (useVision) {
-    try {
-      finalText = await captionImage(image.objectUrl, llmModel);
-    } catch (e) {
-      console.warn('Vision caption failed', e);
-    }
-  }
-  if (triggerWord) finalText = `${triggerWord} ${finalText}`;
-
-  return {
-    imageUrl: image.objectUrl,
-    prompt: prompt.prompt,
-    tag: prompt.tag || '',
-    text: finalText,
-  };
-}
-
-async function generateImportEditItem(importedImage, transformation, index, total, resolution, useVision, llmModel, triggerWord) {
-  addProgressLog(`[${index + 1}/${total}] Editing ${importedImage.name}`, 'info');
-  const end = await generateImage({
-    modelId: getImageModelId(),
-    prompt: transformation,
-    referenceDataUrls: [importedImage.base64],
-    aspectRatio: '1:1',
-    imageSize: resolution,
-  });
-
-  let finalText = transformation;
-  if (useVision) {
-    try {
-      finalText = await captionEditPair(importedImage.base64, end.objectUrl, llmModel);
-    } catch (e) {
-      console.warn('Vision caption failed', e);
-    }
-  }
-  if (triggerWord) finalText = `${triggerWord} ${finalText}`;
-
-  return {
-    startUrl: importedImage.base64,
-    endUrl: end.objectUrl,
-    text: finalText,
-    originalName: importedImage.name,
-  };
-}
-
-// =============================================================================
-// Main generation
-// =============================================================================
-
-async function startGeneration() {
-  await refreshAuthStatus();
-  if (!hasCredentials()) {
-    showApiKeyModal();
-    return;
-  }
-
-  const numPairsInput = document.getElementById('numPairs');
-  const numPairs = parseInt(numPairsInput.value, 10) || 20;
-  const theme = document.getElementById('theme').value.trim();
-  const transformation = document.getElementById('transformation').value.trim();
-  const actionName = document.getElementById('actionName').value.trim();
-  const triggerWord = document.getElementById('triggerWord').value.trim();
-  const maxConcurrent = Math.max(1, Math.min(10, parseInt(document.getElementById('maxConcurrent')?.value, 10) || 2));
-  const aspectRatio = document.getElementById('aspectRatio').value;
-  const resolution = document.getElementById('resolution').value;
-  const useVision = document.getElementById('useVisionCaption').checked;
-  const llmModel = getLlmModelId();
-
-  if (state.mode === 'import-edit') {
-    const importTransformation = document.getElementById('importTransformation')?.value?.trim();
-    if (!importTransformation) {
-      alert('Describe the transformation to apply');
-      return;
-    }
-    if (!state.importedImages.length) {
-      alert('Import images first');
-      return;
-    }
-  } else {
-    if (numPairs > 40) {
-      alert('Maximum 40 items per run. Run again to accumulate more.');
-      numPairsInput.value = 40;
-      return;
-    }
-    if (!theme && state.mode !== 'character') {
-      alert('Fill in the dataset theme');
-      return;
-    }
-    if (state.mode === 'character' && !theme) {
-      // theme optional for character if name set — still require something
-      const name = document.getElementById('characterName')?.value?.trim();
-      if (!name) {
-        alert('Enter a character name or theme/notes');
-        return;
+    reader.onload = async () => {
+      try {
+        const rawUrl = reader.result;
+        const img = await new Promise((res, rej) => {
+          const el = new Image();
+          el.onload = () => res(el);
+          el.onerror = rej;
+          el.src = rawUrl;
+        });
+        const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+        const w = Math.max(1, Math.round(img.width * scale));
+        const h = Math.max(1, Math.round(img.height * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/jpeg', 0.88));
+      } catch {
+        resolve(reader.result);
       }
-    }
-  }
-
-  if (state.mode === 'pair' && !transformation) {
-    alert('Fill in the transformation to learn');
-    return;
-  }
-  if (state.mode === 'reference' && !state.referenceImageBase64) {
-    alert('Upload a reference image');
-    return;
-  }
-  if (state.mode === 'character') {
-    if (!state.characterRefs.face_front) {
-      alert('Upload at least a front face reference');
-      return;
-    }
-  }
-
-  if (state.mode === 'import-edit') {
-    await runImportEdit(maxConcurrent, resolution, useVision, llmModel, triggerWord);
-    return;
-  }
-
-  const currentMode = state.mode;
-  const imagesPerItem = currentMode === 'pair' ? 2 : 1;
-  const modeLabel = currentMode === 'pair' ? 'pairs' : 'images';
-  if (
-    !confirm(
-      `Generate ${numPairs} ${modeLabel}?\nModel: ${getImageModelId()}\nLLM: ${llmModel}\nParallel: ${maxConcurrent}\n~${numPairs * imagesPerItem} image calls`
-    )
-  ) {
-    return;
-  }
-
-  showProgress(true);
-  clearProgressLog();
-  updateProgress(0, numPairs, 'Generating prompts...');
-  addProgressLog('Generating prompts...', 'info');
-  if (autoResumeEnabled()) {
-    addProgressLog('Auto-resume ON — 429/quota failures will retry until done or Stop', 'info');
-  }
-  state.isGenerating = true;
-
-  try {
-    const refs =
-      currentMode === 'character'
-        ? getCharacterRefList()
-        : currentMode === 'reference'
-          ? [state.referenceImageBase64]
-          : [];
-
-    if (currentMode === 'character') {
-      addProgressLog(`Using ${refs.length} character reference image(s)`, 'info');
-    }
-
-    const prompts = await generatePromptsWithLLM(theme, transformation, actionName, numPairs, llmModel);
-    addProgressLog(`Got ${prompts.length} prompts`, 'success');
-
-    const jobs = prompts.map((prompt, index) => ({
-      key: `[${index + 1}/${prompts.length}]`,
-      run: () =>
-        currentMode === 'pair'
-          ? generatePairItem(prompt, index, prompts.length, aspectRatio, resolution, useVision, llmModel, triggerWord)
-          : generateSingleItem(prompt, index, prompts.length, aspectRatio, resolution, useVision, llmModel, triggerWord, refs),
-      onSuccess: (value) => {
-        state.pairCounter += 1;
-        const item = {
-          id: String(state.pairCounter).padStart(4, '0'),
-          mode: currentMode === 'pair' ? 'pair' : 'single',
-          ...value,
-        };
-        state.pairs.push(item);
-        addResultCard(item);
-        updatePairCount();
-        addProgressLog(`#${item.id} complete`, 'success');
-      },
-    }));
-
-    const { completed, failed, stopped } = await runJobsWithAutoResume(jobs, {
-      maxConcurrent,
-      label: modeLabel,
-    });
-
-    if (stopped) {
-      updateProgress(completed, prompts.length, 'Stopped');
-      addProgressLog(`Stopped: ${completed} ok, ${failed} still pending`, 'info');
-    } else if (failed) {
-      updateProgress(completed, prompts.length, 'Finished with failures');
-      addProgressLog(`Done: ${completed} ok, ${failed} failed (auto-resume off or not retryable)`, 'error');
-    } else {
-      updateProgress(prompts.length, prompts.length, 'Complete');
-      addProgressLog(`Done: ${completed} ok — all succeeded`, 'success');
-    }
-    addProgressLog('Click Download ZIP to save', 'info');
-  } catch (error) {
-    addProgressLog(`Error: ${error.message}`, 'error');
-    alert(`Error: ${error.message}`);
-  } finally {
-    state.isGenerating = false;
-  }
+    };
+    reader.readAsDataURL(file);
+  });
 }
-
-async function runImportEdit(maxConcurrent, resolution, useVision, llmModel, triggerWord) {
-  const importTransformation = document.getElementById('importTransformation').value.trim();
-  const imagesToProcess = [...state.importedImages];
-  const totalImages = imagesToProcess.length;
-
-  if (!confirm(`Edit ${totalImages} imported images with ${getImageModelId()}?`)) return;
-
-  showProgress(true);
-  clearProgressLog();
-  updateProgress(0, totalImages, 'Starting edits...');
-  if (autoResumeEnabled()) {
-    addProgressLog('Auto-resume ON — failed edits will retry until done or Stop', 'info');
-  }
-  state.isGenerating = true;
-
-  try {
-    const jobs = imagesToProcess.map((img, index) => ({
-      key: `[${index + 1}/${totalImages}] ${img.name}`,
-      run: () =>
-        generateImportEditItem(img, importTransformation, index, totalImages, resolution, useVision, llmModel, triggerWord),
-      onSuccess: (value) => {
-        state.pairCounter += 1;
-        const item = {
-          id: String(state.pairCounter).padStart(4, '0'),
-          mode: 'pair',
-          ...value,
-        };
-        state.pairs.push(item);
-        addResultCard(item);
-        updatePairCount();
-        addProgressLog(`#${item.id} ${value.originalName}`, 'success');
-      },
-    }));
-
-    const { completed, failed, stopped } = await runJobsWithAutoResume(jobs, {
-      maxConcurrent,
-      label: 'images',
-    });
-
-    if (stopped) {
-      addProgressLog(`Stopped: ${completed} edited, ${failed} pending`, 'info');
-    } else if (failed) {
-      addProgressLog(`Done: ${completed} edited, ${failed} failed`, 'error');
-    } else {
-      addProgressLog(`Done: ${completed} edited — all succeeded`, 'success');
-    }
-  } catch (error) {
-    addProgressLog(`Error: ${error.message}`, 'error');
-    alert(`Error: ${error.message}`);
-  } finally {
-    state.isGenerating = false;
-  }
-}
-
-function stopGeneration() {
-  state.isGenerating = false;
-  addProgressLog('Stopped by user', 'info');
-}
-
-// =============================================================================
-// ZIP
-// =============================================================================
-
-async function downloadZIP() {
-  if (!state.pairs.length) {
-    alert('No images to download');
-    return;
-  }
-
-  const pairsSnapshot = [...state.pairs];
-  showLoading(true, `Creating ZIP (${pairsSnapshot.length})...`);
-
-  try {
-    const JSZip = (await import('https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm')).default;
-    const zip = new JSZip();
-
-    for (let i = 0; i < pairsSnapshot.length; i++) {
-      const item = pairsSnapshot[i];
-      showLoading(true, `Adding ${i + 1}/${pairsSnapshot.length}...`);
-
-      if (item.mode === 'pair' || (item.startUrl && item.endUrl)) {
-        zip.file(`${item.id}_start.png`, await urlToBlob(item.startUrl));
-        zip.file(`${item.id}_end.png`, await urlToBlob(item.endUrl));
-        zip.file(`${item.id}.txt`, item.text || '');
-      } else {
-        zip.file(`${item.id}.png`, await urlToBlob(item.imageUrl));
-        zip.file(`${item.id}.txt`, item.text || '');
-      }
-    }
-
-    const content = await zip.generateAsync({ type: 'blob' });
-    const url = URL.createObjectURL(content);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `gcp_lora_dataset_${Date.now()}.zip`;
-    a.click();
-    URL.revokeObjectURL(url);
-  } catch (error) {
-    alert(`ZIP error: ${error.message}`);
-  } finally {
-    showLoading(false);
-  }
-}
-
-function clearResults() {
-  if (!state.pairs.length) return;
-  if (!confirm(`Clear all ${state.pairs.length} items?`)) return;
-  state.pairs = [];
-  state.pairCounter = 0;
-  document.getElementById('results').innerHTML = '';
-  updatePairCount();
-}
-
-// =============================================================================
-// Init
-// =============================================================================
 
 function populateModelSelects() {
-  const imageSelect = document.getElementById('imageModel');
+  const imageSelect = $('imageModel');
   imageSelect.innerHTML = '';
   Object.values(IMAGE_MODELS).forEach((m) => {
     const opt = document.createElement('option');
@@ -1188,7 +128,7 @@ function populateModelSelects() {
   });
   imageSelect.value = 'gemini-3.1-flash-image';
 
-  const llmSelect = document.getElementById('llmModel');
+  const llmSelect = $('llmModel');
   llmSelect.innerHTML = '';
   Object.values(LLM_MODELS).forEach((m) => {
     const opt = document.createElement('option');
@@ -1197,83 +137,442 @@ function populateModelSelects() {
     llmSelect.appendChild(opt);
   });
   llmSelect.value = 'gemini-3.6-flash';
+
+  const res = $('resolution');
+  res.innerHTML = '';
+  ['1K', '2K', '4K'].forEach((s) => {
+    const opt = document.createElement('option');
+    opt.value = s;
+    opt.textContent = s;
+    res.appendChild(opt);
+  });
 }
 
-async function init() {
-  setDebugSink((level, message, meta) => {
-    // Avoid recursive UI spam: gemini logs already go through addDebugLog formatting.
-    pushClientLog(level, message, meta);
-    if (!verboseDebugEnabled() && level === 'DEBUG') return;
-    const type = level === 'ERROR' ? 'error' : level === 'WARN' ? 'warn' : 'info';
-    const log = document.getElementById('progressLog');
-    if (!log) return;
-    // Only mirror gemini transport logs when progress panel exists / verbose on.
-    if (verboseDebugEnabled() || level === 'ERROR' || level === 'WARN') {
-      const entry = document.createElement('div');
-      entry.className = `log-entry log-${type}`;
-      entry.textContent = `[${new Date().toLocaleTimeString()}] [api] ${message}${meta?.reqId || meta?.clientRequestId ? ` (${meta.reqId || meta.clientRequestId})` : ''}`;
-      log.appendChild(entry);
-      while (log.children.length > 400) log.removeChild(log.firstChild);
-      log.scrollTop = log.scrollHeight;
-    }
-  });
-
-  populateModelSelects();
-  syncResolutionOptions();
-  renderCharacterSlots();
-
-  // Clear old browser API-key / pasted-token settings from earlier builds.
-  ['gcp_lora_provider', 'gcp_lora_api_key', 'gcp_lora_project', 'gcp_lora_location', 'gcp_lora_access_token', 'gcp_lora_use_proxy']
-    .forEach((k) => localStorage.removeItem(k));
-
-  showProgress(true);
-  addProgressLog('Debug logging enabled — use Download Debug Logs after failures', 'info');
-
-  const ready = await refreshAuthStatus();
-  if (!ready) setTimeout(() => showApiKeyModal(), 400);
-
-  document.getElementById('numPairs').addEventListener('input', updateCostEstimate);
-  document.getElementById('useVisionCaption').addEventListener('change', updateCostEstimate);
-  document.getElementById('resolution').addEventListener('change', updateCostEstimate);
-  document.getElementById('imageModel').addEventListener('change', syncResolutionOptions);
-
-  updateCostEstimate();
-  setMode('character');
-  updatePairCount();
-
-  const uploadZone = document.getElementById('uploadZone');
-  if (uploadZone) {
-    uploadZone.addEventListener('dragover', (e) => {
-      e.preventDefault();
-      uploadZone.classList.add('dragover');
-    });
-    uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('dragover'));
-    uploadZone.addEventListener('drop', (e) => {
-      e.preventDefault();
-      uploadZone.classList.remove('dragover');
-      const file = e.dataTransfer.files[0];
-      if (file?.type.startsWith('image/')) {
-        handleReferenceUpload({ target: { files: [file] } });
-      }
+function renderCharacterSlots() {
+  const grid = $('characterSlots');
+  if (!grid) return;
+  grid.innerHTML = '';
+  for (const slot of REF_SLOTS) {
+    const wrap = document.createElement('div');
+    wrap.className = 'char-slot';
+    wrap.innerHTML = `
+      <label class="char-slot-label">${slot.label}${slot.required ? ' *' : ''}</label>
+      <div class="upload-zone char-zone" id="char-zone-${slot.id}">
+        <input type="file" accept="image/*" id="char-input-${slot.id}" hidden />
+        <div class="upload-placeholder" id="char-ph-${slot.id}">
+          <span class="upload-icon">＋</span><span>Upload</span>
+        </div>
+        <img id="char-preview-${slot.id}" class="reference-preview hidden" alt="${slot.label}" />
+      </div>
+    `;
+    grid.appendChild(wrap);
+    const zone = wrap.querySelector(`#char-zone-${slot.id}`);
+    const input = wrap.querySelector(`#char-input-${slot.id}`);
+    zone.addEventListener('click', () => input.click());
+    input.addEventListener('change', async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      await uploadRef(slot.id, file);
     });
   }
 }
 
-window.showApiKeyModal = showApiKeyModal;
-window.hideApiKeyModal = hideApiKeyModal;
-window.refreshAuthStatus = refreshAuthStatus;
+async function ensureCharacter() {
+  const name = $('characterName').value.trim();
+  if (!name) throw new Error('Enter a character name first');
+  const meta = await api('/api/characters', {
+    method: 'POST',
+    body: JSON.stringify({ name, characterName: name }),
+  });
+  state.characterSlug = meta.slug;
+  state.characterName = meta.name;
+  localStorage.setItem('lora_character_slug', meta.slug);
+  localStorage.setItem('lora_character_name', meta.name);
+  $('characterSlugLabel').textContent = `Folder: data/characters/${meta.slug}/`;
+  return meta;
+}
+
+async function uploadRef(slot, file) {
+  showProgress(true);
+  addProgressLog(`Uploading ${slot} to character folder…`, 'info');
+  await ensureCharacter();
+  const dataUrl = await fileToCompressedDataUrl(file);
+  const result = await api(`/api/characters/${encodeURIComponent(state.characterSlug)}/refs`, {
+    method: 'POST',
+    body: JSON.stringify({ slot, dataUrl }),
+  });
+  state.refs[slot] = `${result.url}?t=${Date.now()}`;
+  const preview = $(`char-preview-${slot}`);
+  const ph = $(`char-ph-${slot}`);
+  if (preview) {
+    preview.src = state.refs[slot];
+    preview.classList.remove('hidden');
+  }
+  if (ph) ph.classList.add('hidden');
+  addProgressLog(`Saved ${slot} → ${result.url}`, 'success');
+  setCloseGuard(true);
+}
+
+async function loadCharacterIntoUi(slug) {
+  if (!slug) return;
+  const data = await api(`/api/characters/${encodeURIComponent(slug)}`);
+  state.characterSlug = data.slug;
+  state.characterName = data.name;
+  $('characterName').value = data.name;
+  $('characterSlugLabel').textContent = `Folder: data/characters/${data.slug}/`;
+  state.refs = data.refs || {};
+  for (const slot of REF_SLOTS) {
+    const preview = $(`char-preview-${slot.id}`);
+    const ph = $(`char-ph-${slot.id}`);
+    if (state.refs[slot.id] && preview) {
+      preview.src = `${state.refs[slot.id]}?t=${Date.now()}`;
+      preview.classList.remove('hidden');
+      ph?.classList.add('hidden');
+    }
+  }
+  renderResults(data.items || []);
+  $('pairCount').textContent = (data.items || []).filter((x) => x.status === 'ok').length;
+
+  // Attach latest job so Regenerate works after reload.
+  try {
+    const { jobs } = await api(`/api/jobs?character=${encodeURIComponent(slug)}`);
+    if (jobs?.[0]?.id) {
+      state.jobId = jobs[0].id;
+      localStorage.setItem('lora_active_job', state.jobId);
+      $('activeJobLabel').textContent = `Job ${jobs[0].id} (${jobs[0].status}) → ${slug}`;
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function renderResults(items) {
+  const container = $('results');
+  container.innerHTML = '';
+  const sorted = [...items].sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  for (const item of sorted) {
+    container.appendChild(buildResultCard(item));
+  }
+}
+
+function buildResultCard(item) {
+  const card = document.createElement('div');
+  card.className = 'result-card';
+  card.dataset.itemId = item.id;
+  const imgUrl = item.imageUrl || item.endUrl || '';
+  const bust = item.updatedAt ? `?t=${encodeURIComponent(item.updatedAt)}` : `?t=${Date.now()}`;
+  const statusClass = item.status === 'ok' ? 'success' : item.status === 'failed' ? 'error' : 'info';
+
+  if (item.mode === 'pair' && item.startUrl && item.endUrl) {
+    card.innerHTML = `
+      <div class="result-header">
+        <span class="result-id">#${escapeHtml(item.id)}</span>
+        <span class="result-tag">${escapeHtml(item.status || '')}</span>
+      </div>
+      <div class="result-images">
+        <div class="result-image"><span class="label">START</span><img src="${escapeHtml(item.startUrl + bust)}" alt="start" /></div>
+        <div class="result-image"><span class="label">END</span><img src="${escapeHtml(item.endUrl + bust)}" alt="end" /></div>
+      </div>
+    `;
+  } else {
+    card.innerHTML = `
+      <div class="result-header">
+        <span class="result-id">#${escapeHtml(item.id)}</span>
+        <span class="result-tag">${escapeHtml(item.tag || item.status || '')}</span>
+      </div>
+      <div class="result-images single">
+        <div class="result-image">${imgUrl ? `<img src="${escapeHtml(imgUrl + bust)}" alt="result" />` : `<div class="log-${statusClass}" style="padding:12px">${escapeHtml(item.error || item.status || 'pending')}</div>`}</div>
+      </div>
+    `;
+  }
+
+  const refine = document.createElement('div');
+  refine.className = 'refine-box';
+  refine.innerHTML = `
+    <label>Refine / regenerate prompt</label>
+    <textarea class="refine-input" rows="3">${escapeHtml(item.prompt || item.editPrompt || '')}</textarea>
+    <div class="refine-actions">
+      <button type="button" class="btn btn-sm btn-primary regen-btn">Regenerate</button>
+      <span class="refine-status"></span>
+    </div>
+  `;
+  card.appendChild(refine);
+
+  const caption = document.createElement('div');
+  caption.className = 'result-caption';
+  caption.textContent = truncate(item.text || item.error || '', 200);
+  card.appendChild(caption);
+
+  refine.querySelector('.regen-btn').addEventListener('click', async () => {
+    if (!state.jobId) {
+      alert('No active/loaded job. Start a generation job first (needed to track item ids).');
+      return;
+    }
+    const prompt = refine.querySelector('.refine-input').value.trim();
+    if (!prompt) {
+      alert('Enter a refine prompt');
+      return;
+    }
+    const statusEl = refine.querySelector('.refine-status');
+    const btn = refine.querySelector('.regen-btn');
+    btn.disabled = true;
+    statusEl.textContent = 'queued…';
+    try {
+      setCloseGuard(true);
+      await api(`/api/jobs/${encodeURIComponent(state.jobId)}/items/${encodeURIComponent(item.id)}/regenerate`, {
+        method: 'POST',
+        body: JSON.stringify({ prompt }),
+      });
+      statusEl.textContent = 'regenerating on backend…';
+      addProgressLog(`Regenerate #${item.id} requested`, 'info');
+      startPolling(state.jobId);
+    } catch (e) {
+      statusEl.textContent = e.message;
+      addProgressLog(`Regenerate #${item.id} failed: ${e.message}`, 'error');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  return card;
+}
+
+function applyJobToUi(job, { appendLogs = true } = {}) {
+  state.job = job;
+  const total = job.total || 0;
+  const done = (job.completed || 0) + (job.failed || 0);
+  updateProgress(Math.min(done, total) || job.current || 0, total || 1, `${job.status} · ${job.completed || 0} ok · ${job.failed || 0} failed`);
+  $('pairCount').textContent = job.completed || 0;
+  $('activeJobLabel').textContent = `Job ${job.id} (${job.status}) → ${job.characterSlug}`;
+
+  if (appendLogs) {
+    const logs = job.logs || [];
+    if (logs.length > state.lastLogCount) {
+      for (const row of logs.slice(state.lastLogCount)) {
+        const type = row.level === 'ERROR' ? 'error' : row.level === 'WARN' ? 'warn' : 'info';
+        addProgressLog(row.message, type);
+      }
+      state.lastLogCount = logs.length;
+    }
+  }
+
+  renderResults(job.items || []);
+  setCloseGuard(jobIsActive(job) || (job.items || []).some((x) => x.status === 'regenerating'));
+  if (!jobIsActive(job) && !(job.items || []).some((x) => x.status === 'regenerating')) {
+    stopPolling();
+  }
+}
+
+function stopPolling() {
+  if (state.pollTimer) {
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+}
+
+function startPolling(jobId) {
+  state.jobId = jobId;
+  localStorage.setItem('lora_active_job', jobId);
+  stopPolling();
+  showProgress(true);
+  const tick = async () => {
+    try {
+      const job = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
+      applyJobToUi(job);
+    } catch (e) {
+      addProgressLog(`Poll error: ${e.message}`, 'error');
+    }
+  };
+  tick();
+  state.pollTimer = setInterval(tick, 1500);
+}
+
+async function startGeneration() {
+  try {
+    await ensureCharacter();
+    if (!state.refs.face_front && !$('char-preview-face_front')?.src) {
+      // re-check server
+      const ch = await api(`/api/characters/${encodeURIComponent(state.characterSlug)}`);
+      if (!ch.refs?.face_front) {
+        alert('Upload face_front reference first (saved to character folder)');
+        return;
+      }
+    }
+
+    const payload = {
+      characterName: state.characterName,
+      characterSlug: state.characterSlug,
+      mode: $('modeSelect')?.value || 'character',
+      count: parseInt($('numPairs').value, 10) || 20,
+      imageModel: $('imageModel').value,
+      llmModel: $('llmModel').value,
+      aspectRatio: $('aspectRatio').value,
+      imageSize: $('resolution').value,
+      triggerWord: $('triggerWord').value.trim(),
+      theme: $('theme').value.trim(),
+      useCharacterPresets: $('useCharacterPresets')?.checked !== false,
+      useVisionCaption: $('useVisionCaption').checked,
+      autoResume: $('autoResumeFailed')?.checked !== false,
+      maxConcurrent: parseInt($('maxConcurrent').value, 10) || 1,
+      transformation: $('transformation')?.value?.trim() || '',
+    };
+
+    if (!confirm(`Start backend job for "${state.characterName}"?\nImages save under data/characters/${state.characterSlug}/dataset/\nContinues even if you hide this page.`)) {
+      return;
+    }
+
+    showProgress(true);
+    state.lastLogCount = 0;
+    $('progressLog').innerHTML = '';
+    addProgressLog('Starting backend job…', 'info');
+    const job = await api('/api/jobs', { method: 'POST', body: JSON.stringify(payload) });
+    setCloseGuard(true);
+    addProgressLog(`Job ${job.id} running on server`, 'success');
+    startPolling(job.id);
+  } catch (e) {
+    alert(e.message);
+    addProgressLog(e.message, 'error');
+  }
+}
+
+async function stopGeneration() {
+  if (!state.jobId) return;
+  try {
+    await api(`/api/jobs/${encodeURIComponent(state.jobId)}/stop`, { method: 'POST', body: '{}' });
+    addProgressLog('Stop requested', 'warn');
+  } catch (e) {
+    addProgressLog(`Stop failed: ${e.message}`, 'error');
+  }
+}
+
+async function downloadZIP() {
+  if (!state.characterSlug) {
+    alert('No character selected');
+    return;
+  }
+  // Simple: open character dataset listing via fetching items and zipping in browser from file URLs
+  const ch = await api(`/api/characters/${encodeURIComponent(state.characterSlug)}`);
+  const items = (ch.items || []).filter((x) => x.status === 'ok');
+  if (!items.length) {
+    alert('No saved images in character folder yet');
+    return;
+  }
+  const JSZip = (await import('https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm')).default;
+  const zip = new JSZip();
+  for (const item of items) {
+    if (item.mode === 'pair' && item.startUrl && item.endUrl) {
+      zip.file(`${item.id}_start.png`, await (await fetch(item.startUrl)).blob());
+      zip.file(`${item.id}_end.png`, await (await fetch(item.endUrl)).blob());
+    } else if (item.imageUrl) {
+      zip.file(`${item.id}.png`, await (await fetch(item.imageUrl)).blob());
+    }
+    if (item.textUrl) {
+      zip.file(`${item.id}.txt`, await (await fetch(item.textUrl)).text());
+    } else if (item.text) {
+      zip.file(`${item.id}.txt`, item.text);
+    }
+  }
+  const blob = await zip.generateAsync({ type: 'blob' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `${state.characterSlug}_dataset_${Date.now()}.zip`;
+  a.click();
+}
+
+async function downloadDebugLogs() {
+  let serverLogs = [];
+  try {
+    const payload = await fetchServerLogs(300);
+    serverLogs = payload.logs || [];
+  } catch {
+    /* ignore */
+  }
+  const blob = new Blob(
+    [JSON.stringify({ job: state.job, characterSlug: state.characterSlug, serverLogs }, null, 2)],
+    { type: 'application/json' }
+  );
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `lora_debug_${Date.now()}.json`;
+  a.click();
+}
+
+function syncModeUi() {
+  const mode = $('modeSelect').value;
+  $('transformationSection')?.classList.toggle('hidden', mode !== 'pair');
+}
+
+async function init() {
+  setDebugSink(() => {});
+  populateModelSelects();
+  renderCharacterSlots();
+  syncModeUi();
+  $('modeSelect')?.addEventListener('change', syncModeUi);
+
+  showProgress(true);
+  addProgressLog('Backend job mode: generation continues if you hide the page', 'info');
+
+  const health = await refreshProxyHealth();
+  if (health?.ok) updateStatus(true, `Vertex ADC (${health.project || 'ready'})`);
+  else updateStatus(false, health?.detail || 'Start python server.py');
+
+  if (state.characterName) $('characterName').value = state.characterName;
+  if (state.characterSlug) {
+    try {
+      await loadCharacterIntoUi(state.characterSlug);
+    } catch (e) {
+      addProgressLog(`Could not load character: ${e.message}`, 'warn');
+    }
+  }
+
+  if (state.jobId) {
+    addProgressLog(`Resuming active job ${state.jobId}…`, 'info');
+    startPolling(state.jobId);
+  }
+
+  window.addEventListener('beforeunload', (e) => {
+    if (!state.dirtyCloseGuard && !jobIsActive(state.job)) return;
+    e.preventDefault();
+    e.returnValue = 'Generation may still be running on the backend. Leave this page?';
+    return e.returnValue;
+  });
+
+  // Visibility: keep polling; remind user backend continues.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && jobIsActive(state.job)) {
+      console.log('[lora] page hidden — backend job still running', state.jobId);
+    } else if (!document.hidden && state.jobId) {
+      startPolling(state.jobId);
+    }
+  });
+}
+
 window.startGeneration = startGeneration;
 window.stopGeneration = stopGeneration;
 window.downloadZIP = downloadZIP;
-window.clearResults = clearResults;
-window.setMode = setMode;
-window.toggleSystemPrompt = toggleSystemPrompt;
-window.resetSystemPrompt = resetSystemPrompt;
-window.handleReferenceUpload = handleReferenceUpload;
-window.clearReference = clearReference;
-window.handleImportUpload = handleImportUpload;
-window.clearImportedImages = clearImportedImages;
 window.downloadDebugLogs = downloadDebugLogs;
-window.refreshServerLogsIntoUi = refreshServerLogsIntoUi;
+window.refreshAuthStatus = async () => {
+  const h = await refreshProxyHealth();
+  updateStatus(!!h?.ok, h?.ok ? `Vertex ADC (${h.project})` : h?.detail || 'not ready');
+};
+window.showApiKeyModal = () => {
+  $('apiKeyModal')?.classList.remove('hidden');
+  const h = getProxyHealth();
+  $('authDetail').textContent = h?.ok
+    ? `Vertex ADC ready — jobs save under data/characters/`
+    : h?.detail || 'Start python server.py';
+};
+window.hideApiKeyModal = () => $('apiKeyModal')?.classList.add('hidden');
+window.ensureCharacter = ensureCharacter;
+window.refreshServerLogsIntoUi = async () => {
+  try {
+    const payload = await fetchServerLogs(30);
+    for (const row of (payload.logs || []).slice(-15)) {
+      addProgressLog(`[srv ${row.event}] ${truncate(JSON.stringify(row), 180)}`, row.level === 'ERROR' ? 'error' : 'info');
+    }
+  } catch (e) {
+    addProgressLog(e.message, 'error');
+  }
+};
 
 document.addEventListener('DOMContentLoaded', init);

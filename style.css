@@ -411,6 +411,32 @@ textarea {
   font-family: var(--font-mono);
 }
 
+.refine-box {
+  padding: var(--space-sm) var(--space-md) var(--space-md);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.refine-box label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+.refine-input {
+  min-height: 64px;
+  font-size: 0.8rem;
+}
+.refine-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+.refine-status {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
 .progress-panel {
   background: linear-gradient(135deg, var(--bg-tertiary), var(--bg-secondary));
   border: 1px solid var(--accent-dim);

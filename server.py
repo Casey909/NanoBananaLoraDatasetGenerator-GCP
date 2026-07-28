@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -21,6 +22,7 @@ from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent
 PORT = int(os.environ.get("PORT", "11904"))
@@ -97,6 +99,8 @@ VERTEX_IMAGE_LOCATION = (
     os.environ.get("OSV_VERTEX_IMAGE_LOCATION")
     or VERTEX_LOCATION
 ).strip() or "global"
+
+STORE = None  # set in main()
 
 
 def _client(location: str):
@@ -435,6 +439,13 @@ def generate_text_vertex(payload: dict[str, Any], req_id: str = "") -> dict[str,
     return {"text": text, "debug": {"reqId": req_id, "ms": ms, "finish": str(finish)}}
 
 
+def parse_json_array_safe(text: str) -> list[Any]:
+    match = re.search(r"\[[\s\S]*\]", str(text or ""))
+    if not match:
+        raise ValueError("Failed to parse JSON array from LLM response")
+    return json.loads(match.group(0))
+
+
 def health() -> dict[str, Any]:
     detail = "ok"
     ok = False
@@ -465,7 +476,6 @@ class Handler(SimpleHTTPRequestHandler):
         super().__init__(*args, directory=str(ROOT), **kwargs)
 
     def log_message(self, fmt: str, *args) -> None:
-        # Access logs go through structured logger too.
         log("DEBUG", "http.access", client=self.address_string(), message=(fmt % args))
 
     def _send_json(self, status: int, payload: dict[str, Any]) -> None:
@@ -478,6 +488,28 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _send_file(self, path: Path) -> None:
+        data = path.read_bytes()
+        mime = "application/octet-stream"
+        suf = path.suffix.lower()
+        if suf in {".jpg", ".jpeg"}:
+            mime = "image/jpeg"
+        elif suf == ".png":
+            mime = "image/png"
+        elif suf == ".webp":
+            mime = "image/webp"
+        elif suf == ".txt":
+            mime = "text/plain; charset=utf-8"
+        elif suf == ".json":
+            mime = "application/json"
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -486,17 +518,18 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
-        path = self.path.split("?", 1)[0]
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+
         if path == "/api/health":
-            self._send_json(200, health())
+            h = health()
+            if STORE:
+                h["jobsRunning"] = sum(1 for j in STORE.list_jobs() if j.get("status") in {"running", "queued", "stopping"})
+                h["characters"] = len(STORE.list_characters())
+            self._send_json(200, h)
             return
         if path == "/api/logs":
-            # ?limit=100
-            qs = {}
-            if "?" in self.path:
-                from urllib.parse import parse_qs, urlparse
-
-                qs = parse_qs(urlparse(self.path).query)
             try:
                 limit = max(1, min(500, int((qs.get("limit") or ["100"])[0])))
             except Exception:
@@ -505,10 +538,47 @@ class Handler(SimpleHTTPRequestHandler):
                 items = list(_LOG_RING)[-limit:]
             self._send_json(200, {"ok": True, "count": len(items), "logs": items, "logFile": str(LOG_PATH)})
             return
+        if path == "/api/characters":
+            self._send_json(200, {"characters": STORE.list_characters() if STORE else []})
+            return
+        if path.startswith("/api/characters/") and path.count("/") == 3:
+            slug = unquote(path.split("/")[3])
+            try:
+                self._send_json(200, STORE.get_character(slug))
+            except Exception as exc:
+                self._send_json(404, {"error": {"message": str(exc)}})
+            return
+        if path == "/api/jobs":
+            slug = (qs.get("character") or [None])[0]
+            self._send_json(200, {"jobs": STORE.list_jobs(slug) if STORE else []})
+            return
+        if path.startswith("/api/jobs/") and path.count("/") == 3:
+            job_id = path.split("/")[3]
+            job = STORE.get_job(job_id) if STORE else None
+            if not job:
+                self._send_json(404, {"error": {"message": "Job not found"}})
+                return
+            self._send_json(200, job)
+            return
+        if path.startswith("/api/files/"):
+            # /api/files/{slug}/refs/face_front.jpg
+            parts = path.split("/")
+            # ['', 'api', 'files', slug, ...]
+            if len(parts) < 5:
+                self.send_error(404)
+                return
+            slug = unquote(parts[3])
+            rel = "/".join(unquote(p) for p in parts[4:])
+            try:
+                self._send_file(STORE.resolve_file(slug, rel))
+            except Exception as exc:
+                self._send_json(404, {"error": {"message": str(exc)}})
+            return
         return super().do_GET()
 
     def do_POST(self) -> None:  # noqa: N802
-        path = self.path.split("?", 1)[0]
+        parsed = urlparse(self.path)
+        path = parsed.path
         length = int(self.headers.get("Content-Length") or "0")
         req_id = uuid.uuid4().hex[:10]
         t0 = time.perf_counter()
@@ -519,19 +589,47 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json(400, {"error": {"message": "Invalid JSON body", "reqId": req_id}})
             return
 
-        client_req = str(payload.get("clientRequestId") or "")
         log(
             "INFO",
             "http.request",
             reqId=req_id,
-            clientRequestId=client_req,
             path=path,
             bytes=length,
             client=self.address_string(),
-            keys=sorted([k for k in payload.keys() if k not in {"referenceDataUrls", "imageDataUrls", "references"}]),
+            keys=sorted([k for k in payload.keys() if k not in {"referenceDataUrls", "imageDataUrls", "references", "dataUrl"}]),
         )
 
         try:
+            # Character + job APIs
+            if path == "/api/characters":
+                meta = STORE.ensure_character(payload.get("name") or payload.get("characterName") or "")
+                self._send_json(200, meta)
+                return
+            if path.startswith("/api/characters/") and path.endswith("/refs"):
+                # POST /api/characters/{slug}/refs  {slot, dataUrl}
+                slug = unquote(path.split("/")[3])
+                slot = (payload.get("slot") or "").strip()
+                data_url = payload.get("dataUrl") or ""
+                url = STORE.save_ref_data_url(slug, slot, data_url)
+                self._send_json(200, {"ok": True, "url": url, "slot": slot, "slug": slug})
+                return
+            if path == "/api/jobs":
+                job = STORE.create_and_start_job(payload)
+                self._send_json(200, job)
+                return
+            if path.startswith("/api/jobs/") and path.endswith("/stop"):
+                job_id = path.split("/")[3]
+                self._send_json(200, STORE.stop_job(job_id))
+                return
+            if "/items/" in path and path.endswith("/regenerate"):
+                # /api/jobs/{id}/items/{itemId}/regenerate
+                parts = path.split("/")
+                job_id = parts[3]
+                item_id = parts[5]
+                job = STORE.regenerate_item(job_id, item_id, payload.get("prompt") or "")
+                self._send_json(200, job)
+                return
+
             if path == "/api/generate-image":
                 result = generate_image_vertex(payload, req_id=req_id)
                 log("INFO", "http.response", reqId=req_id, path=path, status=200, ms=int((time.perf_counter() - t0) * 1000))
@@ -542,26 +640,14 @@ class Handler(SimpleHTTPRequestHandler):
                 log("INFO", "http.response", reqId=req_id, path=path, status=200, ms=int((time.perf_counter() - t0) * 1000))
                 self._send_json(200, result)
                 return
-            # Backward-compatible alias — still Vertex ADC, never browser keys.
             if path == "/api/generateContent":
-                # If body looks like raw generateContent, reject with guidance.
-                if "body" in payload and "prompt" not in payload:
-                    self._send_json(
-                        400,
-                        {
-                            "error": {
-                                "message": "Use /api/generate-image or /api/generate-text (Vertex ADC)",
-                                "reqId": req_id,
-                            }
-                        },
-                    )
-                    return
                 if payload.get("prompt") is not None or payload.get("referenceDataUrls") is not None:
                     result = generate_image_vertex(payload, req_id=req_id)
                 else:
                     result = generate_text_vertex(payload, req_id=req_id)
                 self._send_json(200, result)
                 return
+
             log("WARN", "http.not_found", reqId=req_id, path=path)
             self.send_error(404, "Not found")
         except Exception as exc:  # noqa: BLE001
@@ -579,6 +665,10 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main() -> None:
+    global STORE
+    from jobs import JobStore
+
+    STORE = JobStore(log_fn=log)
     log(
         "INFO",
         "server.start",
@@ -589,6 +679,7 @@ def main() -> None:
         location=VERTEX_LOCATION,
         imageLocation=VERTEX_IMAGE_LOCATION,
         logFile=str(LOG_PATH),
+        dataRoot=str(STORE.data_root),
     )
     server = ThreadingHTTPServer((BIND, PORT), Handler)
     try:
