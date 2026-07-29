@@ -70,7 +70,7 @@ Generation defaults:
 - Count: **90**
 - Aspect: **1:1** (clean square for train resize)
 - Image size: user choice (1K/2K/4K per model limits); quality can exceed train size
-- Captions: `\<trigger\>, \<shot description\>, \<appearance / wardrobe cues\>`
+- Captions: `trigger, <shot description>, <appearance / wardrobe cues>`
 
 ## 5. LTX 2.3 train format
 
@@ -147,7 +147,7 @@ Note: LTX 2.0 LoRAs are **not** compatible with 2.3 — always train against the
 
 | Failure | Behavior |
 |---------|----------|
-| Gen job partial failures | Keep successes; export only `status=ok` images; warn if &lt; 60 |
+| Gen job partial failures | Keep successes; export only `status=ok` images; warn if under 60 |
 | Fewer than 60 OK images | Block train; allow export for manual curation |
 | Train CUDA OOM | Fail job with actionable message; pack remains valid for 32GB+/cloud |
 | Missing LTX model / Gemma paths | Settings panel: require `LTX_MODEL_PATH`, `GEMMA_PATH`, `LTX_TRAINER_ROOT` |
