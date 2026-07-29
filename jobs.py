@@ -24,32 +24,7 @@ REF_SLOTS = [
     "extra",
 ]
 
-CHARACTER_SHOT_TEMPLATES = [
-    {"tag": "face_front", "prompt": "close-up front face portrait, eyes looking at camera, neutral expression, soft even studio lighting, plain light gray background, photorealistic, high detail skin and facial features"},
-    {"tag": "face_three_quarter_left", "prompt": "three-quarter view face portrait angled left, soft smile, natural daylight, shallow depth of field, plain background"},
-    {"tag": "face_three_quarter_right", "prompt": "three-quarter view face portrait angled right, calm expression, soft Rembrandt lighting, plain background"},
-    {"tag": "face_profile_left", "prompt": "strict left profile headshot, neutral expression, clean silhouette, soft studio lighting, plain background"},
-    {"tag": "face_profile_right", "prompt": "strict right profile headshot, neutral expression, clean silhouette, soft studio lighting, plain background"},
-    {"tag": "face_looking_up", "prompt": "headshot looking slightly upward, soft hopeful expression, overhead soft light, plain background"},
-    {"tag": "face_looking_down", "prompt": "headshot looking slightly downward, contemplative expression, soft side light, plain background"},
-    {"tag": "expression_smile", "prompt": "close-up portrait with a natural genuine smile, eyes engaged, soft beauty lighting, plain background"},
-    {"tag": "expression_serious", "prompt": "close-up portrait with a serious focused expression, cinematic soft key light, plain background"},
-    {"tag": "expression_laugh", "prompt": "close-up portrait mid-laugh, joyful expression, natural outdoor light, soft bokeh background"},
-    {"tag": "upper_body_front", "prompt": "waist-up portrait facing camera, relaxed arms, casual clothing, soft studio lighting, plain background"},
-    {"tag": "upper_body_side", "prompt": "waist-up three-quarter pose, one hand visible, casual clothing, soft window light, plain background"},
-    {"tag": "full_body_front", "prompt": "full body standing front view head to toe, natural stance, full outfit visible, even lighting, plain seamless background"},
-    {"tag": "full_body_side", "prompt": "full body standing side view, natural posture, full outfit visible, even lighting, plain seamless background"},
-    {"tag": "full_body_back", "prompt": "full body standing back view looking over shoulder toward camera, full outfit visible, even lighting, plain background"},
-    {"tag": "sitting_pose", "prompt": "character sitting casually on a simple stool, waist-up framing, relaxed pose, soft studio lighting, plain background"},
-    {"tag": "walking_pose", "prompt": "full body walking pose mid-stride, natural motion, outdoor soft daylight, simple blurred background"},
-    {"tag": "hands_near_face", "prompt": "close portrait with one hand gently near the face/chin, elegant pose, soft beauty lighting, plain background"},
-    {"tag": "different_outfit", "prompt": "waist-up portrait in a different casual outfit than the references, same person identity preserved, soft studio lighting, plain background"},
-    {"tag": "outdoor_context", "prompt": "outdoor environmental portrait, upper body, natural daylight, park or street soft bokeh, identity consistent with references"},
-    {"tag": "indoor_context", "prompt": "indoor lifestyle portrait, upper body, warm interior lighting, simple room background, identity consistent with references"},
-    {"tag": "dramatic_light", "prompt": "dramatic cinematic portrait, strong contrast lighting, close face framing, dark gradient background, identity preserved"},
-    {"tag": "soft_beauty", "prompt": "beauty headshot, soft diffused light, clean skin detail, gentle catchlights in eyes, light gray seamless background"},
-    {"tag": "wide_angle_full", "prompt": "full body wide shot standing centered, head to toe visible, even lighting, plain seamless studio background"},
-]
+from shots import CHARACTER_SHOT_TEMPLATES
 
 LogFn = Callable[..., None]
 
@@ -302,7 +277,7 @@ class JobStore:
             raise ValueError("Upload at least one character reference (face_front) before starting")
 
         job_id = uuid.uuid4().hex[:12]
-        count = max(1, min(40, int(payload.get("count") or payload.get("numPairs") or 20)))
+        count = max(1, min(90, int(payload.get("count") or payload.get("numPairs") or 90)))
         # Lite only supports 1K — clamp here so job settings match reality.
         requested_size = (payload.get("imageSize") or "1K").strip().upper()
         image_size = "1K" if "lite" in image_model.lower() else requested_size
@@ -408,6 +383,8 @@ class JobStore:
             prompts = []
             for s in shots:
                 theme_bit = f" Theme/context hint: {theme}." if theme else ""
+                caption_core = s["prompt"]
+                ltx_caption = f"{trigger}, {caption_core}" if trigger else caption_core
                 prompts.append(
                     {
                         "prompt": (
@@ -415,6 +392,8 @@ class JobStore:
                             f"{s['prompt']}.{theme_bit} Maintain identity consistency with all references."
                         ),
                         "tag": s["tag"],
+                        "block": s.get("block") or "",
+                        "ltxCaption": ltx_caption,
                     }
                 )
             return prompts
@@ -542,7 +521,7 @@ class JobStore:
                             "imageSize": settings["imageSize"],
                         }
                     )
-                    caption = prompt
+                    caption = prompt_obj.get("ltxCaption") or prompt
                     if settings.get("useVisionCaption"):
                         try:
                             caption = generate_text_vertex(
@@ -555,8 +534,8 @@ class JobStore:
                             )["text"]
                         except Exception:
                             pass
-                    if trigger:
-                        caption = f"{trigger} {caption}".strip()
+                    if trigger and trigger not in caption:
+                        caption = f"{trigger}, {caption}".strip()
                     return self._save_single_item(job_id, item_id, index, prompt_obj, prompt, image, caption, replace)
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
@@ -618,7 +597,9 @@ class JobStore:
                 "status": "ok",
                 "mode": "single",
                 "tag": prompt_obj.get("tag") or "",
+                "block": prompt_obj.get("block") or "",
                 "prompt": prompt,
+                "ltxCaption": prompt_obj.get("ltxCaption") or caption,
                 "text": caption,
                 "imageUrl": f"/api/files/{slug}/dataset/{item_id}.png",
                 "textUrl": f"/api/files/{slug}/dataset/{item_id}.txt",

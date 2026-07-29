@@ -31,16 +31,33 @@ assert.match(jobs, /"characters"/);
 assert.match(jobs, /regenerate_item/);
 assert.match(jobs, /autoResume/);
 
+const shots = load('shots.py');
+assert.match(shots, /CHARACTER_SHOT_TEMPLATES/);
+assert.equal((shots.match(/"tag":/g) || []).length, 90);
+
+const exportPy = load('ltx_export.py');
+assert.match(exportPy, /768/);
+assert.match(exportPy, /dataset\.json/);
+assert.match(exportPy, /export_ltx_pack/);
+
+const trainPy = load('ltx_train.py');
+assert.match(trainPy, /LTX_TRAINER_ROOT/);
+assert.match(trainPy, /start_local_train/);
+
 const app = load('app.js');
 assert.match(app, /beforeunload/);
 assert.match(app, /startPolling/);
 assert.match(app, /Regenerate/);
 assert.match(app, /\/api\/jobs/);
 assert.match(app, /openCropModal/);
+assert.match(app, /exportLtxPack/);
+assert.match(app, /trainLtxLocal/);
 
 const html = load('index.html');
 assert.match(html, /Start Backend Job/);
 assert.match(html, /data\/characters/);
 assert.match(html, /cropModal/);
+assert.match(html, /Export LTX Train Pack/);
+assert.match(html, /Train Locally/);
 
 console.log('selfcheck OK');

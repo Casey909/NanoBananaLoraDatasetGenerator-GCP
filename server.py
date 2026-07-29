@@ -599,6 +599,12 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self._send_json(404, {"error": {"message": str(exc)}})
             return
+        if path.startswith("/api/characters/") and path.endswith("/train") and path.count("/") == 4:
+            slug = unquote(path.split("/")[3])
+            from ltx_train import train_status
+
+            self._send_json(200, train_status(STORE.character_dir(slug)))
+            return
         if path == "/api/jobs":
             slug = (qs.get("character") or [None])[0]
             self._send_json(200, {"jobs": STORE.list_jobs(slug) if STORE else []})
@@ -663,6 +669,22 @@ class Handler(SimpleHTTPRequestHandler):
                 data_url = payload.get("dataUrl") or ""
                 url = STORE.save_ref_data_url(slug, slot, data_url)
                 self._send_json(200, {"ok": True, "url": url, "slot": slot, "slug": slug})
+                return
+            if path.startswith("/api/characters/") and path.endswith("/export-ltx"):
+                slug = unquote(path.split("/")[3])
+                from ltx_export import export_ltx_pack
+
+                trigger = (payload.get("trigger") or payload.get("triggerWord") or "").strip() or None
+                manifest = export_ltx_pack(STORE.character_dir(slug), trigger=trigger)
+                log("INFO", "ltx.export_ok", reqId=req_id, slug=slug, images=manifest.get("imageCount"))
+                self._send_json(200, {"ok": True, **manifest})
+                return
+            if path.startswith("/api/characters/") and path.endswith("/train"):
+                slug = unquote(path.split("/")[3])
+                from ltx_train import start_local_train
+
+                status = start_local_train(STORE.character_dir(slug), log_fn=log)
+                self._send_json(200, status)
                 return
             if path == "/api/jobs":
                 job = STORE.create_and_start_job(payload)

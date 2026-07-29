@@ -757,6 +757,51 @@ async function stopGeneration() {
   }
 }
 
+async function exportLtxPack() {
+  try {
+    await ensureCharacter();
+    const trigger = $('triggerWord').value.trim() || undefined;
+    showProgress(true);
+    addProgressLog('Exporting LTX 2.3 train pack (768×768)…', 'info');
+    const manifest = await api(`/api/characters/${encodeURIComponent(state.characterSlug)}/export-ltx`, {
+      method: 'POST',
+      body: JSON.stringify({ trigger }),
+    });
+    const label = `LTX pack: ${manifest.imageCount}×${manifest.trainSize}px · trigger=${manifest.trigger} · ${manifest.path}`;
+    if ($('ltxPackLabel')) $('ltxPackLabel').textContent = label;
+    addProgressLog(label, 'success');
+    alert(`Exported ${manifest.imageCount} images to ltx_train/ at ${manifest.trainSize}×${manifest.trainSize}`);
+  } catch (e) {
+    addProgressLog(`Export failed: ${e.message}`, 'error');
+    alert(e.message);
+  }
+}
+
+async function trainLtxLocal() {
+  try {
+    await ensureCharacter();
+    if (!confirm('Start local LTX 2.3 train?\nRequires LTX_TRAINER_ROOT, LTX_MODEL_PATH, GEMMA_PATH.\n16GB VRAM may OOM — pack stays intact.')) {
+      return;
+    }
+    showProgress(true);
+    addProgressLog('Starting local LTX train…', 'info');
+    const status = await api(`/api/characters/${encodeURIComponent(state.characterSlug)}/train`, {
+      method: 'POST',
+      body: '{}',
+    });
+    addProgressLog(`Train status: ${status.status} — ${status.message || status.hint || ''}`, status.status === 'failed' ? 'error' : 'info');
+    const poll = async () => {
+      const s = await api(`/api/characters/${encodeURIComponent(state.characterSlug)}/train`);
+      addProgressLog(`Train: ${s.status} ${s.message || s.error || ''}`, s.status === 'failed' ? 'error' : 'info');
+      if (s.status === 'running') setTimeout(poll, 4000);
+    };
+    if (status.status === 'running') setTimeout(poll, 4000);
+  } catch (e) {
+    addProgressLog(`Train failed: ${e.message}`, 'error');
+    alert(e.message);
+  }
+}
+
 async function downloadZIP() {
   if (!state.characterSlug) {
     alert('No character selected');
@@ -829,6 +874,12 @@ async function init() {
   else updateStatus(false, health?.detail || 'Start python server.py');
 
   if (state.characterName) $('characterName').value = state.characterName;
+  // Prefer square for LTX 768 export
+  if ($('aspectRatio')) $('aspectRatio').value = '1:1';
+  if ($('numPairs') && !$('numPairs').value) $('numPairs').value = '90';
+  if ($('triggerWord') && !$('triggerWord').value && state.characterSlug) {
+    $('triggerWord').value = `ohwx_${state.characterSlug.replace(/[^a-z0-9]+/gi, '_').toLowerCase()}`;
+  }
   if (state.characterSlug) {
     try {
       await loadCharacterIntoUi(state.characterSlug);
@@ -861,6 +912,8 @@ async function init() {
 
 window.startGeneration = startGeneration;
 window.stopGeneration = stopGeneration;
+window.exportLtxPack = exportLtxPack;
+window.trainLtxLocal = trainLtxLocal;
 window.downloadZIP = downloadZIP;
 window.downloadDebugLogs = downloadDebugLogs;
 window.refreshAuthStatus = async () => {
