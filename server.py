@@ -176,9 +176,26 @@ def _prepare_ref_image(blob: bytes, mime: str, max_side: int = 1536) -> tuple[st
 
 def _max_refs_for_model(model: str) -> int:
     # Match onestopvideo practical limit; lite is weaker with many refs.
-    if "lite" in model:
-        return 3
+    if "lite" in (model or "").lower():
+        return 2
     return 4
+
+
+def _allowed_sizes_for_model(model: str) -> list[str]:
+    # Nano Banana 2 Lite only accepts 1K; Flash/Pro accept 1K/2K/4K.
+    if "lite" in (model or "").lower():
+        return ["1K"]
+    return ["1K", "2K", "4K"]
+
+
+def _clamp_image_size(model: str, image_size: str) -> str:
+    size = (image_size or "1K").strip().upper()
+    if size == "0.5K":
+        size = "1K"
+    allowed = _allowed_sizes_for_model(model)
+    if size not in allowed:
+        return allowed[0]
+    return size
 
 
 def _build_image_config(types_mod: Any, aspect_ratio: str, image_size: str, allow_person: bool):
@@ -208,7 +225,8 @@ def generate_image_vertex(payload: dict[str, Any], req_id: str = "") -> dict[str
     model = (payload.get("modelId") or payload.get("model") or "").strip()
     prompt = (payload.get("prompt") or "").strip()
     aspect_ratio = (payload.get("aspectRatio") or "1:1").strip()
-    image_size = (payload.get("imageSize") or "1K").strip().upper()
+    requested_size = (payload.get("imageSize") or "1K").strip().upper()
+    image_size = _clamp_image_size(model, requested_size)
     refs = payload.get("referenceDataUrls") or payload.get("references") or []
     client_req = payload.get("clientRequestId") or ""
 
@@ -216,6 +234,16 @@ def generate_image_vertex(payload: dict[str, Any], req_id: str = "") -> dict[str
         raise ValueError("modelId is required")
     if not prompt:
         raise ValueError("prompt is required")
+
+    if image_size != requested_size:
+        log(
+            "WARN",
+            "image.size_clamped",
+            reqId=req_id,
+            model=model,
+            requested=requested_size,
+            using=image_size,
+        )
 
     log(
         "INFO",
@@ -225,6 +253,7 @@ def generate_image_vertex(payload: dict[str, Any], req_id: str = "") -> dict[str
         model=model,
         aspect=aspect_ratio,
         imageSize=image_size,
+        requestedSize=requested_size,
         promptChars=len(prompt),
         promptPreview=prompt[:160],
         refSummary=_summarize_refs(list(refs)),
@@ -234,38 +263,44 @@ def generate_image_vertex(payload: dict[str, Any], req_id: str = "") -> dict[str
 
     client = _client(VERTEX_IMAGE_LOCATION)
     max_refs = _max_refs_for_model(model)
+    ref_max_side = 1024 if "lite" in model.lower() else 1536
 
-    image_parts: list[Any] = []
-    ref_sizes: list[int] = []
-    for idx, ref in enumerate(list(refs)[:max_refs]):
-        if not ref:
-            continue
-        mime_in, blob_in = _decode_data_url(str(ref))
-        mime, blob = _prepare_ref_image(blob_in, mime_in)
-        ref_sizes.append(len(blob))
-        log(
-            "DEBUG",
-            "image.ref_prepared",
-            reqId=req_id,
-            index=idx,
-            mimeIn=mime_in,
-            mimeOut=mime,
-            bytesIn=len(blob_in),
-            bytesOut=len(blob),
-        )
-        image_parts.append(types.Part.from_bytes(data=blob, mime_type=mime))
-
-    if image_parts:
-        contents: Any = [
-            types.Content(
-                role="user",
-                parts=[*image_parts, types.Part.from_text(text=prompt)],
+    def _prepare_parts(ref_list: list[Any], limit: int, max_side: int) -> tuple[list[Any], list[int]]:
+        parts: list[Any] = []
+        sizes: list[int] = []
+        for idx, ref in enumerate(list(ref_list)[:limit]):
+            if not ref:
+                continue
+            mime_in, blob_in = _decode_data_url(str(ref))
+            mime, blob = _prepare_ref_image(blob_in, mime_in, max_side=max_side)
+            sizes.append(len(blob))
+            log(
+                "DEBUG",
+                "image.ref_prepared",
+                reqId=req_id,
+                index=idx,
+                mimeIn=mime_in,
+                mimeOut=mime,
+                bytesIn=len(blob_in),
+                bytesOut=len(blob),
+                maxSide=max_side,
             )
-        ]
-    else:
-        contents = prompt
+            parts.append(types.Part.from_bytes(data=blob, mime_type=mime))
+        return parts, sizes
 
-    def _call(allow_person: bool, size: str):
+    image_parts, ref_sizes = _prepare_parts(list(refs), max_refs, ref_max_side)
+
+    def _contents_for(parts: list[Any]) -> Any:
+        if parts:
+            return [
+                types.Content(
+                    role="user",
+                    parts=[*parts, types.Part.from_text(text=prompt)],
+                )
+            ]
+        return prompt
+
+    def _call(parts: list[Any], prepared: list[int], allow_person: bool, size: str):
         config_kwargs: dict[str, Any] = {"response_modalities": ["TEXT", "IMAGE"]}
         image_cfg = _build_image_config(types, aspect_ratio, size, allow_person)
         if image_cfg is not None:
@@ -277,32 +312,48 @@ def generate_image_vertex(payload: dict[str, Any], req_id: str = "") -> dict[str
             model=model,
             allowPerson=allow_person,
             size=size,
-            refCount=len(image_parts),
-            preparedBytes=ref_sizes,
+            refCount=len(parts),
+            preparedBytes=prepared,
         )
         return client.models.generate_content(
             model=model,
-            contents=contents,
+            contents=_contents_for(parts),
             config=types.GenerateContentConfig(**config_kwargs),
         )
 
     try:
-        response = _call(allow_person=True, size=image_size)
+        response = _call(image_parts, ref_sizes, allow_person=True, size=image_size)
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
         log("WARN", "image.vertex_error", reqId=req_id, error=msg[:400])
-        # Retry once with safer config on INVALID_ARGUMENT (common with phone refs).
-        if "INVALID_ARGUMENT" in msg or "400" in msg:
-            log("INFO", "image.retry_safer", reqId=req_id, reason="INVALID_ARGUMENT")
-            try:
-                response = _call(allow_person=False, size="1K")
-            except Exception as exc2:
-                log("ERROR", "image.retry_failed", reqId=req_id, error=str(exc2)[:400])
+        # Escalate safer configs on INVALID_ARGUMENT (unsupported size/refs/config).
+        if "INVALID_ARGUMENT" in msg or re.search(r"\b400\b", msg):
+            fallbacks: list[tuple[str, int, int, bool]] = [
+                ("1K_no_person", max_refs, ref_max_side, False),
+                ("1K_two_refs", min(2, max_refs), min(ref_max_side, 1024), False),
+                ("1K_one_ref", 1, 768, False),
+            ]
+            last_err: Exception = exc
+            response = None
+            for label, limit, side, allow_person in fallbacks:
+                log("INFO", "image.retry_safer", reqId=req_id, reason=label)
+                try:
+                    parts, sizes = _prepare_parts(list(refs), limit, side)
+                    response = _call(parts, sizes, allow_person=allow_person, size="1K")
+                    break
+                except Exception as exc2:  # noqa: BLE001
+                    last_err = exc2
+                    log("WARN", "image.retry_failed", reqId=req_id, reason=label, error=str(exc2)[:400])
+            if response is None:
+                err2 = str(last_err)
+                # Don't mask quota as invalid-arg — jobs can auto-resume 429s.
+                if "RESOURCE_EXHAUSTED" in err2 or "429" in err2:
+                    raise RuntimeError(err2) from last_err
                 raise RuntimeError(
-                    "Vertex INVALID_ARGUMENT after ref sanitize. "
-                    "Use 1–4 clear JPG/PNG face/body refs (not HEIC albums), "
-                    f"parallel=1. Original: {msg[:240]}"
-                ) from exc
+                    "Vertex INVALID_ARGUMENT after safer retries. "
+                    "Lite model only supports 1K; use 1–2 clear face refs, or switch to Flash/Pro. "
+                    f"Original: {msg[:200]} | Last: {err2[:200]}"
+                ) from last_err
         else:
             raise
 

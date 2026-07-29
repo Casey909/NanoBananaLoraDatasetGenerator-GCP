@@ -21,6 +21,8 @@ assert.match(server, /\/api\/jobs/);
 assert.match(server, /\/api\/characters/);
 assert.match(server, /\/api\/files\//);
 assert.match(server, /JobStore/);
+assert.match(server, /_clamp_image_size/);
+assert.match(server, /image\.size_clamped/);
 
 const jobs = load('jobs.py');
 assert.match(jobs, /class JobStore/);

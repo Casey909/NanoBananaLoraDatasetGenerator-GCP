@@ -397,6 +397,28 @@ function openCropModal(file, { title = 'Crop reference' } = {}) {
   });
 }
 
+function syncResolutionOptions() {
+  const model = IMAGE_MODELS[$('imageModel')?.value] || IMAGE_MODELS['gemini-3.1-flash-image'];
+  const res = $('resolution');
+  if (!res || !model) return;
+  const prev = res.value;
+  res.innerHTML = '';
+  (model.sizes || ['1K']).forEach((s) => {
+    const opt = document.createElement('option');
+    opt.value = s;
+    opt.textContent = s;
+    res.appendChild(opt);
+  });
+  res.value = model.sizes.includes(prev) ? prev : model.sizes[0];
+  const hint = $('resolutionHint');
+  if (hint) {
+    hint.textContent =
+      model.id.includes('lite')
+        ? 'Lite only supports 1K (2K/4K cause Vertex INVALID_ARGUMENT)'
+        : `Allowed: ${model.sizes.join(', ')}`;
+  }
+}
+
 function populateModelSelects() {
   const imageSelect = $('imageModel');
   imageSelect.innerHTML = '';
@@ -407,6 +429,7 @@ function populateModelSelects() {
     imageSelect.appendChild(opt);
   });
   imageSelect.value = 'gemini-3.1-flash-image';
+  imageSelect.addEventListener('change', syncResolutionOptions);
 
   const llmSelect = $('llmModel');
   llmSelect.innerHTML = '';
@@ -418,14 +441,7 @@ function populateModelSelects() {
   });
   llmSelect.value = 'gemini-3.6-flash';
 
-  const res = $('resolution');
-  res.innerHTML = '';
-  ['1K', '2K', '4K'].forEach((s) => {
-    const opt = document.createElement('option');
-    opt.value = s;
-    opt.textContent = s;
-    res.appendChild(opt);
-  });
+  syncResolutionOptions();
 }
 
 function renderCharacterSlots() {

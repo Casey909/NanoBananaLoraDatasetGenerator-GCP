@@ -14,7 +14,7 @@ export const IMAGE_MODELS = {
     id: 'gemini-3.1-flash-lite-image',
     label: 'Nano Banana 2 Lite',
     sizes: ['1K'],
-    maxRefs: 3,
+    maxRefs: 2,
   },
   'gemini-3-pro-image': {
     id: 'gemini-3-pro-image',

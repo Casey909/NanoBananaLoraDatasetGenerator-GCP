@@ -294,19 +294,26 @@ class JobStore:
             raise ValueError("characterName is required")
         meta = self.ensure_character(name or slug, slug)
 
-        refs = self.load_ref_data_urls(slug, max_refs=4)
+        image_model = payload.get("imageModel") or "gemini-3.1-flash-image"
+        max_refs = 2 if "lite" in image_model.lower() else 4
+        refs = self.load_ref_data_urls(slug, max_refs=max_refs)
         mode = payload.get("mode") or "character"
         if mode == "character" and not refs:
             raise ValueError("Upload at least one character reference (face_front) before starting")
 
         job_id = uuid.uuid4().hex[:12]
         count = max(1, min(40, int(payload.get("count") or payload.get("numPairs") or 20)))
+        # Lite only supports 1K — clamp here so job settings match reality.
+        requested_size = (payload.get("imageSize") or "1K").strip().upper()
+        image_size = "1K" if "lite" in image_model.lower() else requested_size
+        if image_size not in {"1K", "2K", "4K"}:
+            image_size = "1K"
         settings = {
             "mode": mode,
-            "imageModel": payload.get("imageModel") or "gemini-3.1-flash-image",
+            "imageModel": image_model,
             "llmModel": payload.get("llmModel") or "gemini-3.6-flash",
             "aspectRatio": payload.get("aspectRatio") or "1:1",
-            "imageSize": payload.get("imageSize") or "1K",
+            "imageSize": image_size,
             "triggerWord": (payload.get("triggerWord") or "").strip(),
             "theme": (payload.get("theme") or "").strip(),
             "useCharacterPresets": payload.get("useCharacterPresets", True),
@@ -459,7 +466,9 @@ class JobStore:
             settings = dict(job["settings"])
             slug = job["characterSlug"]
 
-        refs = self.load_ref_data_urls(slug, max_refs=4)
+        model = settings.get("imageModel") or ""
+        max_refs = 2 if "lite" in model.lower() else 4
+        refs = self.load_ref_data_urls(slug, max_refs=max_refs)
         if prompt_obj is None and item_id:
             with self._lock:
                 item = next((x for x in self._jobs[job_id]["items"] if x["id"] == item_id), None)
@@ -552,7 +561,18 @@ class JobStore:
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
                 msg = str(exc)
-                retryable = any(tok in msg for tok in ("429", "RESOURCE_EXHAUSTED", "UNAVAILABLE", "503", "502", "timeout"))
+                retryable = any(
+                    tok in msg
+                    for tok in (
+                        "429",
+                        "RESOURCE_EXHAUSTED",
+                        "UNAVAILABLE",
+                        "503",
+                        "502",
+                        "timeout",
+                        "INVALID_ARGUMENT",
+                    )
+                )
                 with self._lock:
                     job = self._jobs[job_id]
                     self._append_log(
